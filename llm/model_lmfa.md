@@ -1,7 +1,7 @@
 ## 状态
 - `IDLE`: 当前空闲，监听到的文本先提交给信息提取
 - `NEED_CONFIRM`: 提取得到的信息可能包含日程，需要确认用户意图
-- `EDIT`: 确认了用户希望删改查日程，将信息和当前全部日程交给llm确定具体操作
+- `NEED_OPERATION`: 确认了用户希望删改查日程，将信息和当前全部日程交给llm确定具体操作
 
 ## 操作
 - `extract_info`: 从监听文本中提取用户意图和信息
@@ -13,7 +13,7 @@
 graph TD
 IDLE[IDLE]
 NEED_CONFIRM[NEED_CONFIRM]
-EDIT[EDIT]
+NEED_OPERATION[NEED_OPERATION]
 
 IDLE --> e1((extract_info))
 e1 --> n1(need_confirm
@@ -27,7 +27,7 @@ n2 --> n3(intent=
    --> IDLE
 n2 --> n4(intent=
             query/edit/delete)
-   --> EDIT
+   --> NEED_OPERATION
    --> e2((generate_operation))
    --> s2[[...query/edit/delete with llm-generated operation]]
    --> IDLE

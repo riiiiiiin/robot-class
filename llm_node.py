@@ -56,7 +56,10 @@ class LLMNode(Node):
         result = self.client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
-            stream=False
+            stream=False,
+            response_format={
+                'type': 'json_object'
+            }
         )
         
         self._append_message(result.choices[0].message)
