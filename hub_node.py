@@ -165,7 +165,6 @@ class HubNode(Node):
                         self.dispatch_operation(self._operation_cache)
                     case 'deny':
                         self.clear_history()
-                        self.State = self.State.IDLE
                     case 'edit':
                         self._state = self.State.IDLE
                         self._text_cache += text
@@ -195,12 +194,6 @@ class HubNode(Node):
                         self.query_schedule(operation)
         # TODO: vocal output?
         self.clear_history()
-        self._state = self.State.IDLE
-
-    def clear_history(self):
-        self._operation_cache = None
-        self.clear_history()
-        self._state = self.State.IDLE
     # -------------------------------
     # Editor publishing helper
     # -------------------------------
