@@ -1,0 +1,16 @@
+from .test_llm import llm_loop
+
+test_texts = \
+    '''{"intent": "edit", "old_time": "2024-11-05 10:00:00", "old_description": "团队周会", "new_time": "2024-11-05 11:30:00", "new_description": "团队周会（改为线上）", "all_schedules": [{"id": 1, "time": "2024-11-04 09:00:00", "description": "健身"}, {"id": 2, "time": "2024-11-05 10:00:00", "description": "团队周会"}, {"id": 3, "time": "2024-11-05 15:00:00", "description": "客户拜访"}]}
+    {"intent": "delete", "old_time": "2024-12-01 上午", "old_description": "开会", "new_time": "", "new_description": "", "all_schedules": [{"id": 10, "time": "2024-12-01 09:30:00", "description": "项目进度会"}, {"id": 11, "time": "2024-12-01 11:00:00", "description": "部门例会"}, {"id": 12, "time": "2024-12-01 14:00:00", "description": "培训会"}, {"id": 13, "time": "2024-12-02 10:00:00", "description": "复盘会"}]}
+    {"intent": "query", "old_time": "2024-10-20 18:00:00", "old_description": "", "all_schedules": [{"id": 20, "time": "2024-10-20 17:55:00", "description": "晚饭"}, {"id": 21, "time": "2024-10-20 18:05:00", "description": "看电影"}, {"id": 22, "time": "2024-10-21 18:00:00", "description": "健身"}]}
+    {"intent": "edit", "old_time": "2024-11-15 晚上", "old_description": "生日聚餐", "new_time": "2024-11-15 20:00:00", "new_description": "", "all_schedules": [{"id": 30, "time": "2024-11-15 19:30:00", "description": "生日聚餐"}, {"id": 31, "time": "2024-11-15 20:30:00", "description": "线上游戏"}]}
+    {"intent": "query", "old_time": "", "old_description": "报告", "all_schedules": [{"id": 40, "time": "2024-09-10 10:00:00", "description": "提交月度报告"}, {"id": 41, "time": "2024-10-05 14:00:00", "description": "编写项目报告"}, {"id": 42, "time": "2024-11-01 09:00:00", "description": "周会"}]}
+    {"intent": "delete", "old_time": "", "old_description": "跑步", "new_time": "", "new_description": "", "all_schedules": [{"id": 50, "time": "2024-08-01 07:00:00", "description": "晨跑5公里"}, {"id": 51, "time": "2024-08-03 18:00:00", "description": "夜跑"}]}
+    {"intent": "query", "old_time": "2024-07-04 16:00:00", "old_description": "游泳", "all_schedules": [{"id": 60, "time": "2024-07-04 16:00:00", "description": "写代码"}, {"id": 61, "time": "2024-07-04 17:00:00", "description": "游泳训练"}]}
+    {"intent": "edit", "old_time": "2024-06-01", "old_description": "支付房租", "new_time": "", "new_description": "支付房租和水电费", "all_schedules": [{"id": 70, "time": "2024-05-01 00:00:00", "description": "还信用卡"}, {"id": 71, "time": "2024-06-01 00:00:00", "description": "支付房租"}, {"id": 72, "time": "2024-07-01 00:00:00", "description": "支付房租"}]}
+    {"intent": "edit", "old_time": "2024-11-30 下午", "old_description": "见客户", "new_time": "2024-11-30 16:00:00", "new_description": "与A公司张总会面", "all_schedules": [{"id": 80, "time": "2024-11-30 13:00:00", "description": "内部培训"}, {"id": 81, "time": "2024-11-30 15:00:00", "description": "客户电话沟通"}, {"id": 82, "time": "2024-12-01 14:00:00", "description": "见新客户"}]}
+    {"intent": "query", "old_time": "2025-01-01 12:00:00", "old_description": "外星人见面会", "all_schedules": [{"id": 90, "time": "2024-12-25 12:00:00", "description": "圣诞节午餐"}, {"id": 91, "time": "2025-01-01 20:00:00", "description": "元旦晚会"}]}'''
+
+def test_generate_operation():
+    llm_loop("llm/generate_operation", test_texts)
