@@ -40,7 +40,7 @@ class LLMNode(Node):
         return response
     
     def _append_message(self, message):
-        if len(self.messages) > 10:
+        if len(self.messages) > 30:
             self.messages = self.messages[2:]
             self.get_logger().info('Too many messages, poped 2 messages')
         self.messages.append(message)

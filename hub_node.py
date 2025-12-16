@@ -35,7 +35,6 @@ class HubNode(Node):
         self.declare_parameter('llm_extract_service', 'llm/extract_info')
         self.declare_parameter('llm_check_intent_service', 'llm/check_intent')
         self.declare_parameter('llm_clear_service', 'llm/clear_history')
-        # 新增 TTS 服务名参数
         self.declare_parameter('tts_service', 'tts_service') 
         
         self.declare_parameter('llm_timeout_sec', 5.0)
@@ -75,7 +74,7 @@ class HubNode(Node):
         self._llm_check_client = self.create_client(StringForString, self.llm_check_intent_service_name)
         self._llm_clear_client = self.create_client(SetString, self.llm_clear_service_name)
         
-        # [新增] TTS Client
+        # TTS service client
         self._tts_client = self.create_client(SetString, self.tts_service_name)
 
         # Non-fatal short wait for availability
@@ -91,11 +90,12 @@ class HubNode(Node):
         
         self._state = self.State.IDLE
         self._operation_cache = None
-        self._text_cache = ''
 
         self.get_logger().info("HubNode initialized.")
 
-    # [新增] 说话辅助函数
+    # ---------------------------
+    # TTS helper
+    # ---------------------------
     def speak(self, text: str):
         """Call TTS service to speak text."""
         if not text:
@@ -115,7 +115,6 @@ class HubNode(Node):
     def _asr_callback(self, msg: String):
         try:
             text = msg.data.strip() if msg.data is not None else ''
-            text = self._text_cache + text
         except Exception as e:
             self.get_logger().warn(f"Error reading ASR message: {e}")
             return
@@ -147,13 +146,6 @@ class HubNode(Node):
         self.get_logger().debug("Queue watcher thread exiting.")
 
     def _process_asr_item(self, item: Dict[str, Any]):
-        """
-        Central processing pipeline for a single ASR transcription:
-          1. (TODO) preprocessing
-          2. call llm/generate_operation to obtain structured operation
-          3. if failed to obtain structured op, try check_intent/extract_info fallback
-          4. publish JSON request to schedule_manager via /schedule_manager/request
-        """
         text = item.get('text', '')
         ts = item.get('received_ts', None)
         self.get_logger().info(f"Processing ASR: '{text}' received at {ts}")
@@ -164,6 +156,7 @@ class HubNode(Node):
                 result = json.loads(result_str)
                 candidates = result['candidates']
                 if len(candidates) == 0:
+                    # no candidate, just leave it in context
                     pass
                 else:
                     candidate = candidates[0]
@@ -171,16 +164,17 @@ class HubNode(Node):
                         self._state = self.State.NEED_CONFIRM
                         self._operation_cache = candidate
                         
-                        # [修改] 增加语音反馈，询问确认
                         intent = candidate.get('intent', 'unknown')
                         tts_text = "请确认一下。"
                         if intent == 'add':
                             new_s = candidate.get('new_schedule', {})
-                            tts_text = f"您是想添加在{new_s.get('start_time', '某时')}，{new_s.get('description', '某事')}的日程吗？"
+                            tts_text = f"您是想添加在{new_s.get('start_time', '')}，{new_s.get('description', '')}的日程吗？"
                         elif intent == 'delete':
-                            tts_text = "您确定要删除这个日程吗？"
+                            old_s = candidate.get('old_schedule', {})
+                            tts_text = f"您是想删除在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
                         elif intent == 'query':
-                            tts_text = "您是想查询日程吗？"
+                            old_s = candidate.get('old_schedule', {})
+                            tts_text = f"您是想查询在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
                         self.speak(tts_text)
                         
                     else:
@@ -191,18 +185,25 @@ class HubNode(Node):
                 result = json.loads(result_str)
                 match result['intent']:
                     case 'confirm':
-                        self.speak("好的，正在执行。")  # [修改] 确认反馈
                         self.dispatch_operation(self._operation_cache)
                     case 'deny':
-                        self.speak("好的，已取消。")      # [修改] 取消反馈
+                        self.speak("好的，已取消。")
                         self.clear_history()
                     case 'edit':
-                        self.speak("明白，请告诉我正确的信息。") # [修改] 修改引导
-                        self._state = self.State.IDLE
-                        self._text_cache += text
+                        # the last round contains the corrected information
+                        # so the initial and corrected are both in context
+                        # just tell llm to extract information from context
+                        corrected_result_str = self.extract_info(f'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: {True}')
+                        corrected_result = json.loads(corrected_result_str)
+                        corrected_candidates = corrected_result['candidates']
+                        if len(corrected_candidates) == 0:
+                            # no candidate, just leave it in context
+                            pass
+                        else:
+                            corrected_candidate = corrected_candidates[0]
+                            self.dispatch_operation(corrected_candidate)
                     case 'irrelevant':
-                        # self.speak("抱歉，我没听懂。") # 可选：不做反馈，继续监听
-                        self._text_cache += text
+                        # irrelevant, just leave it in context
                         pass
 
     def dispatch_operation(self, candidate: Dict[str, Any]):
@@ -210,20 +211,17 @@ class HubNode(Node):
         
         if candidate['intent'] == 'add':
             self.add_schedule(candidate)
-            # [修改] 具体反馈
             desc = candidate.get('new_schedule', {}).get('description', '日程')
             feedback_text = f"已添加日程：{desc}。"
         else:
             all_schedules = self.list_schedules()
             candidate.pop('need_confirm')
             candidate['all_schedules'] = all_schedules
-            generated_operations_str = self.generate_operation(json.dumps(candidate)) # 注意: generate_operation 接收字符串
+            generated_operations_str = self.generate_operation(json.dumps(candidate))
             
             try:
-                # 解析返回的操作列表
-                ops_json = json.loads(generated_operations_str)
-                # 兼容 prompt_generate_operation.txt 的输出格式: {candidates: [...]} 或直接 [...]
-                generated_operations = ops_json.get('candidates', []) if isinstance(ops_json, dict) else ops_json
+                generated_operations = json.loads(generated_operations_str)
+                generated_operations = generated_operations.get('candidates', []) if isinstance(generated_operations, dict) else generated_operations
 
                 op_count = 0
                 for operation in generated_operations:
@@ -236,9 +234,9 @@ class HubNode(Node):
                             self.delete_schedule(operation)
                             op_count += 1
                         case 'query':
+                            # query_schedule actually does nothing as we have provided all_schedules
                             self.query_schedule(operation)
-                            # Query 结果是异步的，这里只能反馈“已查询”
-                            feedback_text = "正在为您查询。"
+                            feedback_text += f"您在{operation.get('start_time', '')}有{operation.get('description', '')}的日程。"
 
                 if candidate['intent'] == 'delete':
                     feedback_text = f"已删除 {op_count} 个日程。"
@@ -249,7 +247,7 @@ class HubNode(Node):
                 self.get_logger().error(f"Error parsing/executing operations: {e}")
                 feedback_text = "处理您的请求时遇到了一些问题。"
 
-        self.speak(feedback_text) # [修改] 播报最终结果
+        self.speak(feedback_text)
         self.clear_history()
     # -------------------------------
     # Editor publishing helper
@@ -287,7 +285,6 @@ class HubNode(Node):
         return self._send_to_editor(request_dict)
     
     def patch_schedule(self, operation: Dict[str, Any]):
-        # 构建 patch 对象
         patch_data = {}
         for key in ['start_time', 'end_time', 'location', 'description']:
             if operation.get(key):
