@@ -172,6 +172,10 @@ class HubNode(Node):
                         elif intent == 'delete':
                             old_s = candidate.get('old_schedule', {})
                             tts_text = f"您是想删除在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
+                        elif intent == 'edit':
+                            old_s = candidate.get('old_schedule', {})
+                            new_s = candidate.get('new_schedule', {})
+                            tts_text = f"您是想将{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程修改为{new_s.get('start_time', '')}，{new_s.get('description', '')}吗？"
                         elif intent == 'query':
                             old_s = candidate.get('old_schedule', {})
                             tts_text = f"您是想查询在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
