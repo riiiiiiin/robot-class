@@ -12,7 +12,7 @@ import uuid
 from enum import Enum
 
 from service_define.srv import StringForString
-from service_define.srv import SetString
+from service_define.srv import SetString 
 
 def make_request_id() -> str:
     """Generate a compact request id: <timestamp_ms>-<shortuuid>"""
@@ -35,6 +35,8 @@ class HubNode(Node):
         self.declare_parameter('llm_extract_service', 'llm/extract_info')
         self.declare_parameter('llm_check_intent_service', 'llm/check_intent')
         self.declare_parameter('llm_clear_service', 'llm/clear_history')
+        self.declare_parameter('tts_service', 'tts_service') 
+        
         self.declare_parameter('llm_timeout_sec', 5.0)
         self.declare_parameter('processing_workers', 2)
         self.declare_parameter('max_queue_size', 50)
@@ -47,6 +49,8 @@ class HubNode(Node):
         self.llm_extract_service_name = self.get_parameter('llm_extract_service').get_parameter_value().string_value
         self.llm_check_intent_service_name = self.get_parameter('llm_check_intent_service').get_parameter_value().string_value
         self.llm_clear_service_name = self.get_parameter('llm_clear_service').get_parameter_value().string_value
+        self.tts_service_name = self.get_parameter('tts_service').get_parameter_value().string_value
+        
         self.llm_timeout = float(self.get_parameter('llm_timeout_sec').get_parameter_value().double_value)
         self.processing_workers = self.get_parameter('processing_workers').get_parameter_value().integer_value
         self.max_queue_size = self.get_parameter('max_queue_size').get_parameter_value().integer_value
@@ -58,7 +62,6 @@ class HubNode(Node):
 
         # Subscribers & publishers
         self._asr_sub = self.create_subscription(String, self.asr_topic, self._asr_callback, 10)
-        # Editor (schedule manager) expects std_msgs/String messages whose .data is JSON as in your examples
         self._editor_pub = self.create_publisher(String, self.editor_topic, 10)
 
         # Thread pool for processing
@@ -70,6 +73,9 @@ class HubNode(Node):
         self._llm_extract_client = self.create_client(StringForString, self.llm_extract_service_name)
         self._llm_check_client = self.create_client(StringForString, self.llm_check_intent_service_name)
         self._llm_clear_client = self.create_client(SetString, self.llm_clear_service_name)
+        
+        # TTS service client
+        self._tts_client = self.create_client(SetString, self.tts_service_name)
 
         # Non-fatal short wait for availability
         short_wait = 5.0
@@ -84,19 +90,31 @@ class HubNode(Node):
         
         self._state = self.State.IDLE
         self._operation_cache = None
-        self._text_cache = ''
 
         self.get_logger().info("HubNode initialized.")
 
+    # ---------------------------
+    # TTS helper
+    # ---------------------------
+    def speak(self, text: str):
+        """Call TTS service to speak text."""
+        if not text:
+            return
+        
+        # 简单检查服务是否就绪，不阻塞
+        if self._tts_client.service_is_ready():
+            req = SetString.Request()
+            req.data = text
+            self._tts_client.call_async(req)
+            self.get_logger().info(f"Speaking: {text}")
+        else:
+            self.get_logger().warn("TTS service not ready, cannot speak.")
     # -------------------------------
     # ASR 收集（来自你提供的 ASR 节点）
     # -------------------------------
     def _asr_callback(self, msg: String):
-        """Callback to collect ASR text and enqueue for processing."""
-        # code shows that msg.data is bare text
         try:
             text = msg.data.strip() if msg.data is not None else ''
-            text = self._text_cache + text
         except Exception as e:
             self.get_logger().warn(f"Error reading ASR message: {e}")
             return
@@ -110,7 +128,6 @@ class HubNode(Node):
             self.get_logger().info(f"Enqueued ASR text: '{text}'")
         except queue.Full:
             self.get_logger().warn("ASR queue full; dropping transcription.")
-
     # -------------------------------
     # Queue watcher / worker
     # -------------------------------
@@ -129,13 +146,6 @@ class HubNode(Node):
         self.get_logger().debug("Queue watcher thread exiting.")
 
     def _process_asr_item(self, item: Dict[str, Any]):
-        """
-        Central processing pipeline for a single ASR transcription:
-          1. (TODO) preprocessing
-          2. call llm/generate_operation to obtain structured operation
-          3. if failed to obtain structured op, try check_intent/extract_info fallback
-          4. publish JSON request to schedule_manager via /schedule_manager/request
-        """
         text = item.get('text', '')
         ts = item.get('received_ts', None)
         self.get_logger().info(f"Processing ASR: '{text}' received at {ts}")
@@ -146,17 +156,30 @@ class HubNode(Node):
                 result = json.loads(result_str)
                 candidates = result['candidates']
                 if len(candidates) == 0:
-                    # ignore
+                    # no candidate, just leave it in context
                     pass
                 else:
-                    # might support multiple choices later
                     candidate = candidates[0]
                     if candidate['need_confirm']:
-                        # TODO: vocal output?
                         self._state = self.State.NEED_CONFIRM
                         self._operation_cache = candidate
+                        
+                        intent = candidate.get('intent', 'unknown')
+                        tts_text = "请确认一下。"
+                        if intent == 'add':
+                            new_s = candidate.get('new_schedule', {})
+                            tts_text = f"您是想添加在{new_s.get('start_time', '')}，{new_s.get('description', '')}的日程吗？"
+                        elif intent == 'delete':
+                            old_s = candidate.get('old_schedule', {})
+                            tts_text = f"您是想删除在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
+                        elif intent == 'query':
+                            old_s = candidate.get('old_schedule', {})
+                            tts_text = f"您是想查询在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
+                        self.speak(tts_text)
+                        
                     else:
                         self.dispatch_operation(candidate)
+                        
             case self.State.NEED_CONFIRM:
                 result_str = self.check_intent(text)
                 result = json.loads(result_str)
@@ -164,47 +187,72 @@ class HubNode(Node):
                     case 'confirm':
                         self.dispatch_operation(self._operation_cache)
                     case 'deny':
+                        self.speak("好的，已取消。")
                         self.clear_history()
                     case 'edit':
-                        self._state = self.State.IDLE
-                        self._text_cache += text
+                        # the last round contains the corrected information
+                        # so the initial and corrected are both in context
+                        # just tell llm to extract information from context
+                        corrected_result_str = self.extract_info(f'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: {True}')
+                        corrected_result = json.loads(corrected_result_str)
+                        corrected_candidates = corrected_result['candidates']
+                        if len(corrected_candidates) == 0:
+                            # no candidate, just leave it in context
+                            pass
+                        else:
+                            corrected_candidate = corrected_candidates[0]
+                            self.dispatch_operation(corrected_candidate)
                     case 'irrelevant':
-                        # 相信大模型一定能把无关信息踢掉吧
-                        self._text_cache += text
+                        # irrelevant, just leave it in context
                         pass
 
     def dispatch_operation(self, candidate: Dict[str, Any]):
-        '''
-        This method clears history/cache and restores state to IDLE
-        '''
+        feedback_text = "操作已提交。"
+        
         if candidate['intent'] == 'add':
             self.add_schedule(candidate)
+            desc = candidate.get('new_schedule', {}).get('description', '日程')
+            feedback_text = f"已添加日程：{desc}。"
         else:
             all_schedules = self.list_schedules()
             candidate.pop('need_confirm')
             candidate['all_schedules'] = all_schedules
-            generated_operations = self.generate_operation(candidate)
-            for operation in generated_operations:
-                match operation['operation']:
-                    case 'edit':
-                        self.patch_schedule(operation)
-                    case 'delete':
-                        self.delete_schedule(operation)
-                    case 'query':
-                        self.query_schedule(operation)
-        # TODO: vocal output?
+            generated_operations_str = self.generate_operation(json.dumps(candidate))
+            
+            try:
+                generated_operations = json.loads(generated_operations_str)
+                generated_operations = generated_operations.get('candidates', []) if isinstance(generated_operations, dict) else generated_operations
+
+                op_count = 0
+                for operation in generated_operations:
+                    op_type = operation.get('operation')
+                    match op_type:
+                        case 'edit':
+                            self.patch_schedule(operation)
+                            op_count += 1
+                        case 'delete':
+                            self.delete_schedule(operation)
+                            op_count += 1
+                        case 'query':
+                            # query_schedule actually does nothing as we have provided all_schedules
+                            self.query_schedule(operation)
+                            feedback_text += f"您在{operation.get('start_time', '')}有{operation.get('description', '')}的日程。"
+
+                if candidate['intent'] == 'delete':
+                    feedback_text = f"已删除 {op_count} 个日程。"
+                elif candidate['intent'] == 'edit':
+                    feedback_text = "日程修改成功。"
+            
+            except Exception as e:
+                self.get_logger().error(f"Error parsing/executing operations: {e}")
+                feedback_text = "处理您的请求时遇到了一些问题。"
+
+        self.speak(feedback_text)
         self.clear_history()
     # -------------------------------
     # Editor publishing helper
     # -------------------------------
     def _send_to_editor(self, operation: Dict[str, Any]):
-        """
-        Publish operation (dict) to the editor topic as JSON string in std_msgs/String.data.
-
-        Expected final format examples (based on your samples):
-        {"request_id":"1","op":"now","args":{}}
-        {"request_id":"3","op":"add","args":{"schedule":{ ... }}}
-        """
         if not isinstance(operation, dict):
             raise ValueError("operation must be a dict")
 
@@ -214,6 +262,7 @@ class HubNode(Node):
         msg = String()
         msg.data = payload
         self._editor_pub.publish(msg)
+        return request_id # Return ID if needed
         
     def request_timestamp(self):
         return self._send_to_editor({'op': 'now', 'args': {}})
@@ -229,26 +278,29 @@ class HubNode(Node):
         # TODO: gen id?
         return self._send_to_editor(request_dict)
 
-    def delete_schedule(self, schedule: Dict[str, Any]):
-        del schedule['intent']
+    def delete_schedule(self, operation: Dict[str, Any]):
         request_dict = {}
         request_dict['op'] = 'delete'
-        request_dict['args'] = {'id': schedule['old_schedule']['id']}
+        request_dict['args'] = {'id': operation.get('id')}
         return self._send_to_editor(request_dict)
     
-    def patch_schedule(self, schedule: Dict[str, Any]):
-        del schedule['intent']
+    def patch_schedule(self, operation: Dict[str, Any]):
+        patch_data = {}
+        for key in ['start_time', 'end_time', 'location', 'description']:
+            if operation.get(key):
+                patch_data[key] = operation[key]
+                
         request_dict = {}
         request_dict['op'] = 'update'
-        request_dict['args'] = {'id': schedule['old_schedule']['id'], 'patch': schedule['new_schedule']}
+        request_dict['args'] = {'id': operation.get('id'), 'patch': patch_data}
         return self._send_to_editor(request_dict)
     
-    def query_schedule(self, schedule: Dict[str, Any]):
-        del schedule['intent']
+    def query_schedule(self, operation: Dict[str, Any]):
         request_dict = {}
         request_dict['op'] = 'get'
-        request_dict['args'] = {'id': schedule['old_schedule']['id']}
+        request_dict['args'] = {'id': operation.get('id')}
         return self._send_to_editor(request_dict)
+
     # -------------------------------
     # LLM service call helpers (StringForString and SetString)
     # -------------------------------
@@ -297,9 +349,6 @@ class HubNode(Node):
         return self._call_string_for_string(self._llm_check_client, text, timeout)
 
     def clear_history(self, timeout: Optional[float] = None) -> bool:
-        '''
-        This method clears llm context, _operation_cache and restores state to IDLE
-        '''
         self._operation_cache = None
         self._state = self.State.IDLE
         
