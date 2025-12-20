@@ -346,7 +346,7 @@ class HubNode(Node):
     
     def add_schedule(self, operation: Dict[str, Any]):
         new_data = {}
-        for key in ['start_time', 'end_time', 'location', 'description']:
+        for key in ['start_time', 'end_time', 'place', 'description']:
             if operation.get(key):
                 new_data[key] = operation[key]
         
@@ -363,7 +363,7 @@ class HubNode(Node):
     
     def patch_schedule(self, operation: Dict[str, Any]):
         patch_data = {}
-        for key in ['start_time', 'end_time', 'location', 'description']:
+        for key in ['start_time', 'end_time', 'place', 'description']:
             if operation.get(key):
                 patch_data[key] = operation[key]
                 

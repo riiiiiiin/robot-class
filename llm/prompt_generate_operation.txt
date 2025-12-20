@@ -9,17 +9,17 @@
   "old_schedule":{
     "start_time": "...",
     "end_time": "...",
-    "location": "...",
+    "place": "...",
     "description": "..."
   },
   "new_schedule":{
     "start_time": "...",
     "end_time": "...",
-    "location": "...",
+    "place": "...",
     "description": "..."
   },
   "all_schedules": [
-    {"id": 1, "start_time": "...", "end_time": "...", "location": "...", "description": "..."},
+    {"id": 1, "start_time": "...", "end_time": "...", "place": "...", "description": "..."},
     // ... 更多日程
   ]
 }
@@ -32,7 +32,7 @@
 
 输出格式规范：
 你必须严格输出一个 JSON 对象，格式如下：
-{candidates: [{"operation": "edit|delete|query", "id": ..., "start_time": "...", "end_time": "...", "location": "...", "description": "..."},]}
+{candidates: [{"operation": "edit|delete|query", "id": ..., "start_time": "...", "end_time": "...", "place": "...", "description": "..."},]}
 匹配与生成规则：
 
 核心匹配原则：id 是日程的唯一标识，且永不重复。你的首要任务是通过比对 old_schedule 的信息，在 all_schedules 中找到匹配的日程，并使用其 id。
@@ -63,9 +63,9 @@
 
 地点匹配策略：
 
-如果给定的 old_schedule 的 location 不为空，则尝试精确匹配。如果无法精确匹配，允许匹配所有地点。
+如果给定的 old_schedule 的 place 不为空，则尝试精确匹配。如果无法精确匹配，允许匹配所有地点。
 
-如果给定的 old_schedule 的 location 为空，则允许匹配所有地点。
+如果给定的 old_schedule 的 place 为空，则允许匹配所有地点。
 
 注意：你需要优先保证描述相关，即时间/地点很精确但是描述不相关的日程，不能视为匹配。
 
@@ -79,11 +79,11 @@ operation: “edit”
 
 id: 被修改日程的 id
 
-start_time: new_schedule 的 start_time，如果未提供，则使用 old_schedule 的 start_time
+start_time: new_schedule 的 start_time ，如果未提供，则使用 old_schedule 的 start_time
 
-end_time: new_schedule 的 end_time，如果未提供，则使用 old_schedule 的 end_time
+end_time: new_schedule 的 end_time ，如果未提供，则使用 old_schedule 的 end_time
 
-location: new_schedule 的 location，如果未提供，则使用 old_schedule 的 location
+place: new_schedule 的 place ，如果未提供，则使用 old_schedule 的 place
 
 description: new_schedule 的 description，如果未提供，则使用 old_schedule 的 description
 
@@ -99,7 +99,7 @@ start_time: 必须是空字符串""
 
 end_time: 必须是空字符串""
 
-location: 必须是空字符串""
+place: 必须是空字符串""
 
 description: 必须是空字符串""
 
@@ -115,7 +115,7 @@ start_time: 匹配的日程的 start_time
 
 end_time: 匹配的日程的 end_time
 
-location: 匹配的日程的 location
+place: 匹配的日程的 place
 
 description: 匹配的日程的 description
 
@@ -128,18 +128,18 @@ description: 匹配的日程的 description
   "old_schedule": {
     "start_time": "2023-10-01 09:00:00",
     "end_time": "2023-10-01 10:00:00",
-    "location": "会议室A",
+    "place": "会议室A",
     "description": "团队周会"
   },
   "new_schedule": {
     "start_time": "",
     "end_time": "",
-    "location": "会议室B",
+    "place": "会议室B",
     "description": ""
   },
   "all_schedules": [
-    {"id": 1, "start_time": "2023-10-01 09:00:00", "end_time": "2023-10-01 10:00:00", "location": "会议室A", "description": "团队周会"},
-    {"id": 2, "start_time": "2023-10-02 14:00:00", "end_time": "2023-10-02 15:00:00", "location": "办公室", "description": "个人工作"}
+    {"id": 1, "start_time": "2023-10-01 09:00:00", "end_time": "2023-10-01 10:00:00", "place": "会议室A", "description": "团队周会"},
+    {"id": 2, "start_time": "2023-10-02 14:00:00", "end_time": "2023-10-02 15:00:00", "place": "办公室", "description": "个人工作"}
   ]
 }
 ```
@@ -152,7 +152,7 @@ description: 匹配的日程的 description
       "id": 1,
       "start_time": "2023-10-01 09:00:00",
       "end_time": "2023-10-01 10:00:00",
-      "location": "会议室B",
+      "place": "会议室B",
       "description": "团队周会"
     }
   ]
@@ -167,14 +167,14 @@ description: 匹配的日程的 description
   "old_schedule": {
     "start_time": "2023-10-04 08:00:00",
     "end_time": "",
-    "location": "健身房",
+    "place": "健身房",
     "description": "健身"
   },
   "new_schedule": {},
   "all_schedules": [
-    {"id": 2, "start_time": "2023-10-04 16:00:00", "end_time": "2023-10-04 17:00:00", "location": "健身房", "description": "健身"},
-    {"id": 3, "start_time": "2023-10-11 16:00:00", "end_time": "2023-10-11 17:00:00", "location": "健身房", "description": "健身"},
-    {"id": 4, "start_time": "2023-10-04 18:00:00", "end_time": "2023-10-04 19:00:00", "location": "健身房", "description": "瑜伽课"}
+    {"id": 2, "start_time": "2023-10-04 16:00:00", "end_time": "2023-10-04 17:00:00", "place": "健身房", "description": "健身"},
+    {"id": 3, "start_time": "2023-10-11 16:00:00", "end_time": "2023-10-11 17:00:00", "place": "健身房", "description": "健身"},
+    {"id": 4, "start_time": "2023-10-04 18:00:00", "end_time": "2023-10-04 19:00:00", "place": "健身房", "description": "瑜伽课"}
   ]
 }
 ```
@@ -188,7 +188,7 @@ description: 匹配的日程的 description
       "id": 2,
       "start_time": "",
       "end_time": "",
-      "location": "",
+      "place": "",
       "description": ""
     }
   ]
@@ -203,14 +203,14 @@ description: 匹配的日程的 description
   "old_schedule": {
     "start_time": "2023-10-01 08:00:00",
     "end_time": "2023-10-02 23:59:59",
-    "location": "",
+    "place": "",
     "description": ""
   },
   "new_schedule": {},
   "all_schedules": [
-    {"id": 1, "start_time": "2023-10-01 09:00:00", "end_time": "2023-10-01 10:00:00", "location": "会议室A", "description": "团队周会"},
-    {"id": 2, "start_time": "2023-10-02 14:00:00", "end_time": "2023-10-02 15:00:00", "location": "办公室", "description": "个人工作"},
-    {"id": 4, "start_time": "2023-10-04 16:00:00", "end_time": "2023-10-04 17:00:00", "location": "健身房", "description": "健身"}
+    {"id": 1, "start_time": "2023-10-01 09:00:00", "end_time": "2023-10-01 10:00:00", "place": "会议室A", "description": "团队周会"},
+    {"id": 2, "start_time": "2023-10-02 14:00:00", "end_time": "2023-10-02 15:00:00", "place": "办公室", "description": "个人工作"},
+    {"id": 4, "start_time": "2023-10-04 16:00:00", "end_time": "2023-10-04 17:00:00", "place": "健身房", "description": "健身"}
   ]
 }
 ```
@@ -224,7 +224,7 @@ description: 匹配的日程的 description
       "id": 1,
       "start_time": "2023-10-01 09:00:00",
       "end_time": "2023-10-01 10:00:00",
-      "location": "会议室A",
+      "place": "会议室A",
       "description": "团队周会"
     },
     {
@@ -232,7 +232,7 @@ description: 匹配的日程的 description
       "id": 2,
       "start_time": "2023-10-02 14:00:00",
       "end_time": "2023-10-02 15:00:00",
-      "location": "办公室",
+      "place": "办公室",
       "description": "个人工作"
     }
   ]
