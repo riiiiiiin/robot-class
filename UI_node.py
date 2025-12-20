@@ -41,7 +41,7 @@ DELETE_DELAY = 2000         # 删除操作延迟执行时间(ms)
 TEMP_MONTH_DISPLAY_DURATION = 10000  # 临时切换月份显示时长(ms)
 
 # 文件/ROS配置
-JSON_PATH = "schedule.json"          # 日程数据本地存储路径
+JSON_PATH = os.environ.get('SCHEDULE_PATH')          # 日程数据本地存储路径
 ROS_TOPIC_NAME = "/schedule_manager/response"  # ROS2订阅话题名
 
 # ================= ROS2订阅模块 =================
@@ -62,9 +62,9 @@ class ROS2SubscriberNode(Node):
     def listener_callback(self, msg):
         """ROS2消息回调函数"""
         try:
-            # 解析JSON消息并转发到Qt主线程
             data = json.loads(msg.data)
             self.get_logger().info(f"收到日程更新消息: {data}")
+            # 发出原始字典，UI线程自行决定是否刷新（基于 ok/op）
             self.signal_emitter.ros_msg_received.emit(data)
         except json.JSONDecodeError as e:
             self.get_logger().error(f"JSON解析失败: {e}")
@@ -96,15 +96,25 @@ class ScheduleItem(QWidget):
     """日程卡片组件"""
     def __init__(self, data, highlight_color=None):
         super().__init__()
-        self.data = data  # 日程数据
-        # 设置高亮色（默认使用主题色）
+        self.data = data  # 日程数据 (fields: id, description, place, start_time, end_time)
         self.highlight_color = highlight_color or THEME_COLOR
         
-        # 解析时间
-        raw_time = data.get("time", "")
-        t_start, t_end = (raw_time.split("-") if "-" in raw_time else (raw_time, ""))
+        # 获取显示字段
+        desc = data.get("description", "")
+        place = data.get("place", "待定")
+        st = data.get("start_time") or ""
+        et = data.get("end_time") or ""
+        # 仅显示时间部分（HH:MM）以便界面简洁；如果没有则显示空
+        def time_of_day(ts):
+            if not ts:
+                return ""
+            try:
+                return ts[11:16]  # "YYYY-MM-DD HH:MM:SS" -> "HH:MM"
+            except Exception:
+                return ts
+        t_start = time_of_day(st)
+        t_end = time_of_day(et)
         
-        # 基础样式
         self.setStyleSheet(f"background-color: transparent; border-radius: 4px;")
         
         # 主布局
@@ -121,27 +131,25 @@ class ScheduleItem(QWidget):
         """)
         layout.addWidget(self.color_bar)
         
-        # 日程信息区域（标题+地点）
+        # 信息区： description + place
         info_vbox = QVBoxLayout()
         info_vbox.setSpacing(4)
         
-        # 日程标题
-        self.title_label = QLabel(data["title"])
-        self.title_label.setFont(QFont("WenQuanYi Micro Hei", 18, QFont.Bold))
-        self.title_label.setStyleSheet(f"""
+        self.desc_label = QLabel(desc)
+        self.desc_label.setFont(QFont("WenQuanYi Micro Hei", 18, QFont.Bold))
+        self.desc_label.setStyleSheet(f"""
             color: white;
             text-shadow: 0 0 8px {self.highlight_color}80;
         """)
-        info_vbox.addWidget(self.title_label)
+        info_vbox.addWidget(self.desc_label)
         
-        # 日程地点
-        self.loc_label = QLabel(f"{data.get('location', '待定')}")
-        self.loc_label.setFont(QFont("WenQuanYi Micro Hei", 12))
-        self.loc_label.setStyleSheet(f"""
+        self.place_label = QLabel(place)
+        self.place_label.setFont(QFont("WenQuanYi Micro Hei", 12))
+        self.place_label.setStyleSheet(f"""
             color: #E0E0E0;
             text-shadow: 0 0 6px {self.highlight_color}60;
         """)
-        info_vbox.addWidget(self.loc_label)
+        info_vbox.addWidget(self.place_label)
         
         layout.addLayout(info_vbox, 1)
         
@@ -177,11 +185,11 @@ class ScheduleItem(QWidget):
             background-color: {self.highlight_color}; 
             border-radius: 3px;
         """)
-        self.title_label.setStyleSheet(f"""
+        self.desc_label.setStyleSheet(f"""
             color: white;
             text-shadow: 0 0 8px {self.highlight_color}80;
         """)
-        self.loc_label.setStyleSheet(f"""
+        self.place_label.setStyleSheet(f"""
             color: #E0E0E0;
             text-shadow: 0 0 6px {self.highlight_color}60;
         """)
@@ -278,7 +286,7 @@ class DayCell(QWidget):
 
 # ================= 主窗口 =================
 class CalendarUI(QWidget):
-    """日历主窗口"""
+    """日历主窗口（订阅 response 决定何时 reload 文件）"""
     def __init__(self):
         super().__init__()
         self.signal_emitter = SignalEmitter()  # 信号发射器
@@ -537,49 +545,39 @@ class CalendarUI(QWidget):
         if expired_ids:
             self.update_schedule_list(self.current_selected_day)
 
+    # Note: 本地操作处理函数保留但在订阅响应模式下通常不直接调用（UI 以 reload 文件为准）
     def handle_add(self, args):
-        """处理新增日程"""
+        """（保留）本地新增处理：不作为订阅驱动的主要更新路径"""
         schedule = args.get("schedule")
         if not schedule:
             print("添加失败：无日程数据")
             return
-        date = schedule.get("date")
-        if not date:
-            print("添加失败：无日期信息")
-            return
-        # 自动生成ID（如果未提供）
+        # 本例中 UI 的主更新来自 reload 文件；此函数仅提供本地快速插入（可选）
+        st = schedule.get("start_time")
+        date_key = st[:10] if st else "__undated__"
         if not schedule.get("id"):
-            schedule["id"] = f"{date}-{uuid.uuid4().hex[:6]}"
-        # 添加到日程数据
-        if date not in self.schedule_data:
-            self.schedule_data[date] = []
-        self.schedule_data[date].append(schedule)
-        # 按时间排序
-        self.schedule_data[date].sort(key=lambda x: x.get("time", ""))
-        
-        # 标记高亮
+            schedule["id"] = f"local-{uuid.uuid4().hex[:6]}"
+        if date_key not in self.schedule_data:
+            self.schedule_data[date_key] = []
+        self.schedule_data[date_key].append(schedule)
+        # 排序基于 start_time（若存在）
+        self.schedule_data[date_key].sort(key=lambda x: x.get("start_time") or "")
         self.mark_highlight(schedule["id"], "add")
 
     def handle_delete(self, args):
-        """处理删除日程"""
+        """（保留）本地删除处理：不作为订阅驱动的主要更新路径"""
         schedule_id = args.get("id")
         if not schedule_id:
             print("删除失败：无日程ID")
             return
-        
-        # 标记高亮
         self.mark_highlight(schedule_id, "delete")
-        
-        # 延迟删除（先显示高亮再删除）
         def delete_delayed():
             deleted = False
-            # 遍历查找并删除日程
-            for date, items in self.schedule_data.items():
+            for date, items in list(self.schedule_data.items()):
                 for i, item in enumerate(items):
                     if item.get("id") == schedule_id:
                         del items[i]
                         deleted = True
-                        # 如果该日期无日程，删除日期键
                         if not items:
                             del self.schedule_data[date]
                         break
@@ -587,129 +585,108 @@ class CalendarUI(QWidget):
                     break
             if not deleted:
                 print(f"删除失败：无ID为{schedule_id}的日程")
-            # 刷新UI并保存数据
             self.refresh_calendar_ui()
             self.save_local_data()
-        
         QTimer.singleShot(DELETE_DELAY, delete_delayed)
 
     def handle_update(self, args):
-        """处理修改日程"""
+        """（保留）本地修改处理"""
         schedule_id = args.get("id")
         patch = args.get("patch", {})
         if not schedule_id or not patch:
             print("修改失败：ID或修改内容为空")
             return
-        
         updated = False
-        # 遍历查找并更新日程
-        for date, items in self.schedule_data.items():
+        for date, items in list(self.schedule_data.items()):
             for item in items:
                 if item.get("id") == schedule_id:
-                    # 更新字段
                     item.update(patch)
-                    # 处理日期变更
-                    new_date = patch.get("date")
-                    if new_date and new_date != date:
-                        items.remove(item)
-                        # 清理原日期空数据
-                        if not items:
-                            del self.schedule_data[date]
-                        # 添加到新日期
-                        if new_date not in self.schedule_data:
-                            self.schedule_data[new_date] = []
-                        self.schedule_data[new_date].append(item)
+                    new_st = item.get("start_time")
+                    if new_st:
+                        new_date = new_st[:10]
+                        if new_date != date:
+                            items.remove(item)
+                            if not items:
+                                del self.schedule_data[date]
+                            if new_date not in self.schedule_data:
+                                self.schedule_data[new_date] = []
+                            self.schedule_data[new_date].append(item)
                     updated = True
                     break
             if updated:
                 break
-        
         if not updated:
             print(f"修改失败：无ID为{schedule_id}的日程")
             return
-        
-        # 标记高亮
         self.mark_highlight(schedule_id, "update")
 
     def handle_get(self, args):
-        """处理查询日程"""
+        """（保留）本地查询处理"""
         schedule_id = args.get("id")
         if schedule_id:
-            # 查找指定ID的日程
             for date, items in self.schedule_data.items():
                 for item in items:
                     if item.get("id") == schedule_id:
-                        # 标记高亮
                         self.mark_highlight(schedule_id, "get")
-                        # 选中该日程日期
-                        self.current_selected_day = int(date.split("-")[2])
-                        self.update_schedule_list(self.current_selected_day)
+                        if item.get("start_time"):
+                            self.select_target_date(item["start_time"][:10])
                         return
             print(f"查询失败：无ID为{schedule_id}的日程")
         else:
-            # 全量查询仅刷新UI，不高亮
             self.refresh_calendar_ui()
 
     def handle_ros_msg(self, msg):
-        """处理ROS2消息（核心逻辑）"""
-        op = msg.get("op")          # 操作类型
-        args = msg.get("args", {})  # 操作参数
+        """
+        处理 ROS2 message：仅在收到成功的 add/delete/update/get response 时，
+        才从文件 reload 全量 schedules 并刷新 UI；并尽量从响应中或重新加载的数据中推断受影响的 id/日期以高亮/跳转。
+        """
+        ok = bool(msg.get("ok", False))
+        op = msg.get("op")
+        args = msg.get("args", {}) or {}
+        data = msg.get("data", {}) or {}
 
-        # 解析目标月份和日期
-        target_month = None
-        target_date = None
-        
+        # 仅关心成功的 CRUD/query 响应
+        if not ok or op not in ("add", "delete", "update", "get", "list"):
+            # 不刷新 UI
+            return
+
+        # 尽量推断受影响的 schedule id（优先从 response.data, fallback 到 args）
+        affected_id = None
         if op == "add":
-            # 新增操作：从schedule中解析日期
-            schedule = args.get("schedule")
-            if schedule and "date" in schedule:
-                target_month = schedule["date"][:7]
-                target_date = schedule["date"]
-                
-        elif op in ["delete", "update"]:
-            # 删除/修改：从ID或patch中解析日期
-            schedule_id = args.get("id")
-            patch = args.get("patch", {})
-            if "date" in patch:
-                target_month = patch["date"][:7]
-                target_date = patch["date"]
-            elif schedule_id and "-" in schedule_id:
-                # 从ID中解析日期（格式：YYYY-MM-DD-xxx）
-                date_part = schedule_id.split("-")[:3]
-                if len(date_part) >= 2:
-                    target_month = f"{date_part[0]}-{date_part[1]}"
-                if len(date_part) >= 3:
-                    target_date = f"{date_part[0]}-{date_part[1].zfill(2)}-{date_part[2].zfill(2)}"
-                    
-        elif op == "get":
-            # 查询：从ID中解析日期
-            schedule_id = args.get("id")
-            if schedule_id and "-" in schedule_id:
-                date_part = schedule_id.split("-")[:3]
-                if len(date_part) >= 2:
-                    target_month = f"{date_part[0]}-{date_part[1]}"
-                if len(date_part) >= 3:
-                    target_date = f"{date_part[0]}-{date_part[1].zfill(2)}-{date_part[2].zfill(2)}"
-
-        # 临时切换到目标月份
-        if target_month:
-            self.switch_to_temp_month(target_month)
-
-        # 执行对应操作
-        if op == "add":
-            self.handle_add(args)
+            affected_id = data.get("id") or args.get("schedule", {}).get("id")
         elif op == "delete":
-            self.handle_delete(args)
-        elif op == "update":
-            self.handle_update(args)
-        elif op == "get":
-            self.handle_get(args)
+            affected_id = args.get("id") or data.get("id")
+        else:
+            affected_id = args.get("id") or data.get("id") or (data.get("schedule", {}) or {}).get("id")
 
-        # 选中目标日期
-        if target_date:
-            self.select_target_date(target_date)
+        # 重新从文件全量加载 schedules（保证以文件为单一真源）
+        self.schedule_data = self.load_local_data()
 
-        # 刷新UI并保存数据
+        # 如果能找到 affected_id 在新加载的数据中，则高亮并跳转到对应日期
+        target_date = None
+        if affected_id:
+            for date_key, items in self.schedule_data.items():
+                for item in items:
+                    if item.get("id") == affected_id:
+                        target_date = date_key
+                        break
+                if target_date:
+                    break
+
+        # 如果找到了目标日期则临时切换显示并选中该日
+        if target_date and target_date != "__undated__":
+            # target_date 格式 "YYYY-MM-DD"
+            try:
+                self.switch_to_temp_month(target_date[:7])
+                self.select_target_date(target_date)
+            except Exception:
+                pass
+
+        # 标记高亮（基于 op 和 affected_id）
+        if affected_id:
+            self.mark_highlight(affected_id, "update" if op == "update" else op)
+
+        # 最后刷新 UI 并保存（UI 的主状态来自文件）
         self.refresh_calendar_ui()
         self.save_local_data()
 
@@ -778,12 +755,25 @@ class CalendarUI(QWidget):
             with open(JSON_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 processed = {}
-                # 按日期分组
                 for item in data.get("schedules", []):
-                    date = item["date"]
-                    if date not in processed:
-                        processed[date] = []
-                    processed[date].append(item)
+                    # item expected keys: id, description, place, start_time, end_time
+                    st = item.get("start_time")
+                    if st:
+                        date_key = st[:10]  # "YYYY-MM-DD"
+                    else:
+                        date_key = "__undated__"
+                    if date_key not in processed:
+                        processed[date_key] = []
+                    processed[date_key].append({
+                        "id": item.get("id"),
+                        "description": item.get("description", ""),
+                        "place": item.get("place", ""),
+                        "start_time": item.get("start_time"),
+                        "end_time": item.get("end_time")
+                    })
+                # 对每个日期按 start_time 排序（无 start_time 放在末尾）
+                for dkey, items in processed.items():
+                    items.sort(key=lambda x: x.get("start_time") or "9999")
                 return processed
         except Exception as e:
             print(f"加载本地数据失败: {e}")
@@ -795,8 +785,15 @@ class CalendarUI(QWidget):
             # 转换为列表格式
             all_schedules = []
             for date, items in self.schedule_data.items():
-                all_schedules.extend(items)
-            # 写入文件
+                # 把 __undated__ 的 key 转换为没有 start_time 的条目
+                for it in items:
+                    all_schedules.append({
+                        "id": it.get("id"),
+                        "description": it.get("description", ""),
+                        "place": it.get("place", ""),
+                        "start_time": it.get("start_time"),
+                        "end_time": it.get("end_time")
+                    })
             with open(JSON_PATH, "w", encoding="utf-8") as f:
                 json.dump({"schedules": all_schedules}, f, ensure_ascii=False, indent=2)
         except Exception as e:
