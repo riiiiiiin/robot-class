@@ -21,7 +21,7 @@ class SimpleScheduleManager(Node):
         super().__init__("schedule_manager")
 
         # 配置数据文件路径（默认 ~/.ros/schedule_data.json）
-        default_path = str(Path.home() / "robot-class" / "schedule" / "schedule_data.json")
+        default_path = str(os.environ.get('SCHEDULE_PATH'))
         self.declare_parameter("data_file", default_path)
         self.data_file = self.get_parameter("data_file").get_parameter_value().string_value or default_path
 
