@@ -246,8 +246,8 @@ class HubNode(Node):
                             self.delete_schedule(operation)
                             op_count += 1
                         case 'query':
-                            # query_schedule actually does nothing as we have provided all_schedules
-                            self.query_schedule(operation)
+                            # query_schedule don't have to wait as we have already provided llm all the schedules
+                            self.query_schedule_no_wait(operation)
                             feedback_text += f"您在{operation.get('start_time', '')}有{operation.get('description', '')}的日程。"
 
                 if candidate['intent'] == 'delete':
@@ -382,6 +382,10 @@ class HubNode(Node):
             self.get_logger().warn(f"query_schedule error: {resp.get('error')}")
             return None
         return resp.get("data", {}).get("schedule")
+    
+    def query_schedule_no_wait(self, operation: Dict[str, Any]):
+        request_dict = {'op': 'get', 'args': {'id': operation.get('id')}}
+        return self._send_to_editor(request_dict)
 
     # -------------------------------
     # LLM service call helpers (StringForString and SetString)
