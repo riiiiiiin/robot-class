@@ -30,6 +30,7 @@ class HubNode(Node):
         # Parameters
         self.declare_parameter('asr_topic', '/asr_result')
         self.declare_parameter('editor_topic', '/schedule_manager/request')
+        self.declare_parameter('editor_topic_response', '/schedule_manager/response')
         self.declare_parameter('llm_chat_service', 'llm/chat')
         self.declare_parameter('llm_generate_service', 'llm/generate_operation')
         self.declare_parameter('llm_extract_service', 'llm/extract_info')
@@ -44,6 +45,7 @@ class HubNode(Node):
         # Read parameters
         self.asr_topic = self.get_parameter('asr_topic').get_parameter_value().string_value
         self.editor_topic = self.get_parameter('editor_topic').get_parameter_value().string_value
+        self.editor_topic_response = self.get_parameter('editor_topic_response').get_parameter_value().string_value
         self.llm_chat_service_name = self.get_parameter('llm_chat_service').get_parameter_value().string_value
         self.llm_generate_service_name = self.get_parameter('llm_generate_service').get_parameter_value().string_value
         self.llm_extract_service_name = self.get_parameter('llm_extract_service').get_parameter_value().string_value
@@ -63,9 +65,15 @@ class HubNode(Node):
         # Subscribers & publishers
         self._asr_sub = self.create_subscription(String, self.asr_topic, self._asr_callback, 10)
         self._editor_pub = self.create_publisher(String, self.editor_topic, 10)
+        self._editor_response_sub = self.create_subscription(String, self.editor_topic_response, self._editor_response_callback, 10)
 
         # Thread pool for processing
         self._executor_pool = ThreadPoolExecutor(max_workers=max(1, self.processing_workers))
+        
+        # Lock for thread sync (blocking) wait
+        self._pending_lock = threading.Lock()
+        self._pending_events: Dict[str, threading.Event] = {}
+        self._pending_responses: Dict[str, Dict[str, Any]] = {}
 
         # LLM service clients
         self._llm_chat_client = self.create_client(StringForString, self.llm_chat_service_name)
@@ -214,7 +222,7 @@ class HubNode(Node):
         feedback_text = "操作已提交。"
         
         if candidate['intent'] == 'add':
-            self.add_schedule(candidate)
+            self.add_schedule(candidate['new_'])
             desc = candidate.get('new_schedule', {}).get('description', '日程')
             feedback_text = f"已添加日程：{desc}。"
         else:
@@ -267,19 +275,84 @@ class HubNode(Node):
         msg.data = payload
         self._editor_pub.publish(msg)
         return request_id # Return ID if needed
+    
+    def _editor_response_callback(self, msg: String):
+        try:
+            if not msg or not msg.data:
+                return
+            payload = json.loads(msg.data)
+            if not isinstance(payload, dict):
+                return
+            request_id = payload.get("request_id")
+            if not request_id:
+                return
+
+            # 保存响应并触发等待事件（线程安全）
+            with self._pending_lock:
+                self._pending_responses[str(request_id)] = payload
+                evt = self._pending_events.get(str(request_id))
+                if evt:
+                    evt.set()
+
+        except Exception as e:
+            # 解析异常不要抛出，否则会影响 subscriber 回调线程
+            self.get_logger().error(f"_on_editor_response parse error: {e}")
+    
+    def _wait_for_response(self, request_id: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+        """
+        阻塞等待指定 request_id 的响应，返回解析后的响应 dict 或 None（超时或无效响应）。
+        timeout: 等待秒数（float）
+        """
+        rid = str(request_id)
+        evt = threading.Event()
+        with self._pending_lock:
+            # 如果已经有响应了（极端情况），直接返回
+            if rid in self._pending_responses:
+                return self._pending_responses.pop(rid, None)
+            self._pending_events[rid] = evt
+
+        try:
+            waited = evt.wait(timeout=timeout)
+            with self._pending_lock:
+                resp = self._pending_responses.pop(rid, None)
+                # 清理事件对象
+                self._pending_events.pop(rid, None)
+            if not waited:
+                # 超时
+                self.get_logger().warn(f"等待 response 超时 request_id={rid} timeout={timeout}s")
+                return None
+            return resp
+        finally:
+            # 确保事件字典中条目被清理（以防万一）
+            with self._pending_lock:
+                self._pending_events.pop(rid, None)
+    
+    def request_timestamp(self, timeout = 5):
+        rid = self._send_to_editor({'op': 'now', 'args': {}})
+        resp = self._wait_for_response(rid, timeout=timeout)
+        if not resp or not resp.get("ok"):
+            return None
+        return resp.get("data")
+    
+    def list_schedules(self, timeout = 5):
+        rid = self._send_to_editor({'op': 'list', 'args': {}})
+        resp = self._wait_for_response(rid, timeout=timeout)
+        if not resp:
+            return None
+        if not resp.get("ok"):
+            self.get_logger().warn(f"list_schedules error: {resp.get('error')}")
+            return None
+        return resp.get("data", {}).get("schedules")
+    
+    def add_schedule(self, operation: Dict[str, Any]):
+        new_data = {}
+        for key in ['start_time', 'end_time', 'location', 'description']:
+            if operation.get(key):
+                new_data[key] = operation[key]
         
-    def request_timestamp(self):
-        return self._send_to_editor({'op': 'now', 'args': {}})
-    
-    def list_schedules(self):
-        return self._send_to_editor({'op': 'list', 'args': {}})
-    
-    def add_schedule(self, schedule: Dict[str, Any]):
-        del schedule['intent']
         request_dict = {}
         request_dict['op'] = 'add'
-        request_dict['args'] = {'schedule': schedule['new_schedule']}
-        # TODO: gen id?
+        request_dict['args'] = {'schedule': new_data}
         return self._send_to_editor(request_dict)
 
     def delete_schedule(self, operation: Dict[str, Any]):
@@ -299,11 +372,16 @@ class HubNode(Node):
         request_dict['args'] = {'id': operation.get('id'), 'patch': patch_data}
         return self._send_to_editor(request_dict)
     
-    def query_schedule(self, operation: Dict[str, Any]):
-        request_dict = {}
-        request_dict['op'] = 'get'
-        request_dict['args'] = {'id': operation.get('id')}
-        return self._send_to_editor(request_dict)
+    def query_schedule(self, operation: Dict[str, Any], timeout=5):
+        request_dict = {'op': 'get', 'args': {'id': operation.get('id')}}
+        rid = self._send_to_editor(request_dict)
+        resp = self._wait_for_response(rid, timeout=timeout)
+        if not resp:
+            return None
+        if not resp.get("ok"):
+            self.get_logger().warn(f"query_schedule error: {resp.get('error')}")
+            return None
+        return resp.get("data", {}).get("schedule")
 
     # -------------------------------
     # LLM service call helpers (StringForString and SetString)
