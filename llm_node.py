@@ -53,20 +53,26 @@ class LLMNode(Node):
         messages = [{"role": "system", "content": f"{system_prompt.replace("[CURRENT_TIME]", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}"},]
         messages.extend(self.messages)
         
-        result = self.client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            stream=False,
-            response_format={
-                'type': 'json_object'
-            }
-        )
+        try:
+            result = self.client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                stream=False,
+                response_format={
+                    'type': 'json_object'
+                }
+            )
         
-        self._append_message(result.choices[0].message)
-        self.get_logger().info(f'Received LLM response: "{result.choices[0].message}"')
-        response.data = result.choices[0].message.content
+            self._append_message(result.choices[0].message)
+            self.get_logger().info(f'Received LLM response: "{result.choices[0].message}"')
+            response.data = result.choices[0].message.content
 
-        return response
+            return response
+        
+        except Exception as e:
+            self.get_logger().error(f'LLM request failed: {e}')
+            response.data = str(e)
+            return response
 
     def _handle_extract_info(self, request, response):
         return self._handle_llm_request(request, response, self.prompt_extract_info)

@@ -1,15 +1,16 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String
 import threading
-import queue
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, Any
 import json
 import uuid
 from enum import Enum
+import traceback
 
 from service_define.srv import StringForString
 from service_define.srv import SetString 
@@ -22,8 +23,8 @@ def make_request_id() -> str:
 
 class HubNode(Node):
     class State(Enum):
-        IDLE = 0,
-        NEED_CONFIRM = 1,
+        IDLE = 0
+        NEED_CONFIRM = 1
     def __init__(self, node_name: str = 'hub_node'):
         super().__init__(node_name)
 
@@ -38,9 +39,8 @@ class HubNode(Node):
         self.declare_parameter('llm_clear_service', 'llm/clear_history')
         self.declare_parameter('tts_service', 'tts_service') 
         
-        self.declare_parameter('llm_timeout_sec', 5.0)
+        self.declare_parameter('llm_timeout_sec', 10.0)
         self.declare_parameter('processing_workers', 2)
-        self.declare_parameter('max_queue_size', 50)
 
         # Read parameters
         self.asr_topic = self.get_parameter('asr_topic').get_parameter_value().string_value
@@ -55,12 +55,8 @@ class HubNode(Node):
         
         self.llm_timeout = float(self.get_parameter('llm_timeout_sec').get_parameter_value().double_value)
         self.processing_workers = self.get_parameter('processing_workers').get_parameter_value().integer_value
-        self.max_queue_size = self.get_parameter('max_queue_size').get_parameter_value().integer_value
 
         self.get_logger().info(f"HubNode started. ASR topic: {self.asr_topic}, Editor topic: {self.editor_topic}")
-
-        # Internal queue for ASR texts
-        self._asr_queue = queue.Queue(maxsize=self.max_queue_size)
 
         # Subscribers & publishers
         self._asr_sub = self.create_subscription(String, self.asr_topic, self._asr_callback, 10)
@@ -93,8 +89,6 @@ class HubNode(Node):
             pass  # we'll handle availability at call time
 
         self._closed = False
-        self._queue_watcher_thread = threading.Thread(target=self._queue_watcher, daemon=True)
-        self._queue_watcher_thread.start()
         
         self._state = self.State.IDLE
         self._operation_cache = None
@@ -121,6 +115,7 @@ class HubNode(Node):
     # ASR 收集（来自你提供的 ASR 节点）
     # -------------------------------
     def _asr_callback(self, msg: String):
+        print(msg)
         try:
             text = msg.data.strip() if msg.data is not None else ''
         except Exception as e:
@@ -132,97 +127,94 @@ class HubNode(Node):
             return
 
         try:
-            self._asr_queue.put_nowait({'text': text, 'received_ts': time.time()})
-            self.get_logger().info(f"Enqueued ASR text: '{text}'")
-        except queue.Full:
-            self.get_logger().warn("ASR queue full; dropping transcription.")
-    # -------------------------------
-    # Queue watcher / worker
-    # -------------------------------
-    def _queue_watcher(self):
-        self.get_logger().debug("Queue watcher thread started.")
-        while rclpy.ok() and not self._closed:
-            try:
-                item = self._asr_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            self._executor_pool.submit(self._process_asr_item, item)
-            try:
-                self._asr_queue.task_done()
-            except Exception:
-                pass
-        self.get_logger().debug("Queue watcher thread exiting.")
+            self._process_asr_item({'text': text, 'received_ts': time.time()})
+        except Exception as e:
+            self.get_logger().warn(f"Error processing ASR text: {e}")
+            
+        print(1)
 
     def _process_asr_item(self, item: Dict[str, Any]):
-        text = item.get('text', '')
-        ts = item.get('received_ts', None)
-        self.get_logger().info(f"Processing ASR: '{text}' received at {ts}")
+        try:
+            text = item.get('text', '')
+            ts = item.get('received_ts', None)
+            self.get_logger().info(f"Processing ASR: '{text}' received at {ts}")
 
-        match self._state:
-            case self.State.IDLE:
-                result_str = self.extract_info(f'text: {text}, pre_confirmed: {self._operation_cache is not None }')
-                result = json.loads(result_str)
-                candidates = result['candidates']
-                if len(candidates) == 0:
-                    # no candidate, just leave it in context
-                    pass
-                else:
-                    candidate = candidates[0]
-                    if candidate['need_confirm']:
-                        self._state = self.State.NEED_CONFIRM
-                        self._operation_cache = candidate
-                        
-                        intent = candidate.get('intent', 'unknown')
-                        tts_text = "请确认一下。"
-                        if intent == 'add':
-                            new_s = candidate.get('new_schedule', {})
-                            tts_text = f"您是想添加在{new_s.get('start_time', '')}，{new_s.get('description', '')}的日程吗？"
-                        elif intent == 'delete':
-                            old_s = candidate.get('old_schedule', {})
-                            tts_text = f"您是想删除在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
-                        elif intent == 'edit':
-                            old_s = candidate.get('old_schedule', {})
-                            new_s = candidate.get('new_schedule', {})
-                            tts_text = f"您是想将{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程修改为{new_s.get('start_time', '')}，{new_s.get('description', '')}吗？"
-                        elif intent == 'query':
-                            old_s = candidate.get('old_schedule', {})
-                            tts_text = f"您是想查询在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
-                        self.speak(tts_text)
-                        
-                    else:
-                        self.dispatch_operation(candidate)
-                        
-            case self.State.NEED_CONFIRM:
-                result_str = self.check_intent(text)
-                result = json.loads(result_str)
-                match result['intent']:
-                    case 'confirm':
-                        self.dispatch_operation(self._operation_cache)
-                    case 'deny':
-                        self.speak("好的，已取消。")
-                        self.clear_history()
-                    case 'edit':
-                        # the last round contains the corrected information
-                        # so the initial and corrected are both in context
-                        # just tell llm to extract information from context
-                        corrected_result_str = self.extract_info(f'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: {True}')
-                        corrected_result = json.loads(corrected_result_str)
-                        corrected_candidates = corrected_result['candidates']
-                        if len(corrected_candidates) == 0:
-                            # no candidate, just leave it in context
-                            pass
-                        else:
-                            corrected_candidate = corrected_candidates[0]
-                            self.dispatch_operation(corrected_candidate)
-                    case 'irrelevant':
-                        # irrelevant, just leave it in context
+            match self._state:
+                case self.State.IDLE:
+                    result_str = self.extract_info(f'text: {text}, pre_confirmed: {self._operation_cache is not None }')
+                    try:
+                        result = json.loads(result_str)
+                    except Exception as e:
+                        self.get_logger().warn(f"Error parsing result: {e}")
+                        result = {'candidates': []}
+                    
+                    candidates = result['candidates']
+                    print(candidates)
+                    if len(candidates) == 0:
+                        # no candidate, just leave it in context
                         pass
+                    else:
+                        candidate = candidates[0]
+                        if candidate['need_confirm']:
+                            self._state = self.State.NEED_CONFIRM
+                            self._operation_cache = candidate
+                        
+                            intent = candidate.get('intent', 'unknown')
+                            tts_text = "请确认一下。"
+                            if intent == 'add':
+                                new_s = candidate.get('new_schedule', {})
+                                tts_text = f"您是想添加在{new_s.get('start_time', '')}，{new_s.get('description', '')}的日程吗？"
+                            elif intent == 'delete':
+                                old_s = candidate.get('old_schedule', {})
+                                tts_text = f"您是想删除在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
+                            elif intent == 'edit':
+                                old_s = candidate.get('old_schedule', {})
+                                new_s = candidate.get('new_schedule', {})
+                                tts_text = f"您是想将{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程修改为{new_s.get('start_time', '')}，{new_s.get('description', '')}吗？"
+                            elif intent == 'query':
+                                old_s = candidate.get('old_schedule', {})
+                                tts_text = f"您是想查询在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
+                            self.speak(tts_text)
+                        
+                        else:
+                            self.dispatch_operation(candidate)
+                        
+                case self.State.NEED_CONFIRM:
+                    result_str = self.check_intent(text)
+                    result = json.loads(result_str)
+                    match result['intent']:
+                        case 'confirm':
+                            self.dispatch_operation(self._operation_cache)
+                        case 'deny':
+                            self.speak("好的，已取消。")
+                            self.clear_history()
+                        case 'edit':
+                            # the last round contains the corrected information
+                            # so the initial and corrected are both in context
+                            # just tell llm to extract information from context
+                            corrected_result_str = self.extract_info(f'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: {True}')
+                            corrected_result = json.loads(corrected_result_str)
+                            corrected_candidates = corrected_result['candidates']
+                            if len(corrected_candidates) == 0:
+                                # no candidate, just leave it in context
+                                pass
+                            else:
+                                corrected_candidate = corrected_candidates[0]
+                                self.dispatch_operation(corrected_candidate)
+                        case 'irrelevant':
+                            # irrelevant, just leave it in context
+                            pass
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+        
+        print(3)
 
     def dispatch_operation(self, candidate: Dict[str, Any]):
         feedback_text = "操作已提交。"
         
         if candidate['intent'] == 'add':
-            self.add_schedule(candidate['new_'])
+            self.add_schedule(candidate['new_schedule'])
             desc = candidate.get('new_schedule', {}).get('description', '日程')
             feedback_text = f"已添加日程：{desc}。"
         else:
@@ -467,8 +459,6 @@ class HubNode(Node):
             self._executor_pool.shutdown(wait=True)
         except Exception:
             pass
-        if self._queue_watcher_thread.is_alive():
-            self._queue_watcher_thread.join(timeout=1.0)
         super().destroy_node()
         self.get_logger().info("HubNode destroyed.")
 
@@ -476,7 +466,7 @@ class HubNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = HubNode()
-    executor = SingleThreadedExecutor()
+    executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
         executor.spin()
