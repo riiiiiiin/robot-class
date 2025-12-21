@@ -68,7 +68,7 @@ class HubNode(Node):
         
         # Lock for thread sync (blocking) wait
         self._pending_lock = threading.Lock()
-        self._pending_events: Dict[str, threading.Event] = {}
+        self._pending_events: Dict[str, Any] = {}
         self._pending_responses: Dict[str, Dict[str, Any]] = {}
 
         # LLM service clients
@@ -115,10 +115,11 @@ class HubNode(Node):
     # ASR 收集（来自你提供的 ASR 节点）
     # -------------------------------
     def _asr_callback(self, msg: String):
-        print(msg)
         try:
+            self.get_logger().info(f"_asr_callback received: {msg.data!r}")
             text = msg.data.strip() if msg.data is not None else ''
         except Exception as e:
+            traceback.print_exc()
             self.get_logger().warn(f"Error reading ASR message: {e}")
             return
 
@@ -129,36 +130,41 @@ class HubNode(Node):
         try:
             self._process_asr_item({'text': text, 'received_ts': time.time()})
         except Exception as e:
+            traceback.print_exc()
             self.get_logger().warn(f"Error processing ASR text: {e}")
-            
-        print(1)
+
 
     def _process_asr_item(self, item: Dict[str, Any]):
+        """
+        非阻塞异步版：发起 extract_info_async，然后在回调中继续处理，
+        所有后续调用都使用 *_async 的接口。
+        """
         try:
             text = item.get('text', '')
             ts = item.get('received_ts', None)
-            self.get_logger().info(f"Processing ASR: '{text}' received at {ts}")
+            self.get_logger().info(f"Processing ASR (async): '{text}' received at {ts}")
 
-            match self._state:
-                case self.State.IDLE:
-                    result_str = self.extract_info(f'text: {text}, pre_confirmed: {self._operation_cache is not None }')
-                    try:
-                        result = json.loads(result_str)
-                    except Exception as e:
-                        self.get_logger().warn(f"Error parsing result: {e}")
+            def _on_extract_done(result_str):
+                try:
+                    if not result_str:
                         result = {'candidates': []}
-                    
-                    candidates = result['candidates']
-                    print(candidates)
-                    if len(candidates) == 0:
-                        # no candidate, just leave it in context
-                        pass
                     else:
+                        try:
+                            result = json.loads(result_str)
+                        except Exception as e:
+                            self.get_logger().warn(f"Error parsing extract_info result: {e}")
+                            result = {'candidates': []}
+
+                    # proceed per state
+                    if self._state == self.State.IDLE:
+                        candidates = result.get('candidates', [])
+                        if len(candidates) == 0:
+                            return
                         candidate = candidates[0]
-                        if candidate['need_confirm']:
+                        if candidate.get('need_confirm'):
                             self._state = self.State.NEED_CONFIRM
                             self._operation_cache = candidate
-                        
+
                             intent = candidate.get('intent', 'unknown')
                             tts_text = "请确认一下。"
                             if intent == 'add':
@@ -175,88 +181,166 @@ class HubNode(Node):
                                 old_s = candidate.get('old_schedule', {})
                                 tts_text = f"您是想查询在{old_s.get('start_time', '')}，{old_s.get('description', '')}的日程吗？"
                             self.speak(tts_text)
-                        
                         else:
-                            self.dispatch_operation(candidate)
-                        
-                case self.State.NEED_CONFIRM:
-                    result_str = self.check_intent(text)
-                    result = json.loads(result_str)
-                    match result['intent']:
-                        case 'confirm':
-                            self.dispatch_operation(self._operation_cache)
-                        case 'deny':
-                            self.speak("好的，已取消。")
-                            self.clear_history()
-                        case 'edit':
-                            # the last round contains the corrected information
-                            # so the initial and corrected are both in context
-                            # just tell llm to extract information from context
-                            corrected_result_str = self.extract_info(f'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: {True}')
-                            corrected_result = json.loads(corrected_result_str)
-                            corrected_candidates = corrected_result['candidates']
-                            if len(corrected_candidates) == 0:
-                                # no candidate, just leave it in context
-                                pass
-                            else:
-                                corrected_candidate = corrected_candidates[0]
-                                self.dispatch_operation(corrected_candidate)
-                        case 'irrelevant':
-                            # irrelevant, just leave it in context
-                            pass
-        except Exception as e:
+                            # no confirm required -> dispatch asynchronously
+                            try:
+                                # dispatch_operation_async will do list_schedules_async & generate op async
+                                self.dispatch_operation_async(candidate)
+                            except Exception as e:
+                                self.get_logger().error(f"dispatch_operation_async error: {e}")
+                    elif self._state == self.State.NEED_CONFIRM:
+                        # user input is in 'text' variable above; call check_intent_async
+                        def _on_check_done(check_str):
+                            try:
+                                if not check_str:
+                                    return
+                                res = json.loads(check_str)
+                                intent = res.get('intent')
+                                if intent == 'confirm':
+                                    self.dispatch_operation_async(self._operation_cache)
+                                elif intent == 'deny':
+                                    self.speak("好的，已取消。")
+                                    # clear_history_async no blocking
+                                    self.clear_history_async()
+                                elif intent == 'edit':
+                                    # ask LLM to extract corrected info (async)
+                                    def _on_corrected_extract(corrected_str):
+                                        try:
+                                            if not corrected_str:
+                                                return
+                                            corrected_json = json.loads(corrected_str)
+                                            corrected_candidates = corrected_json.get('candidates', [])
+                                            if len(corrected_candidates) == 0:
+                                                return
+                                            corrected_candidate = corrected_candidates[0]
+                                            self.dispatch_operation_async(corrected_candidate)
+                                        except Exception as e:
+                                            self.get_logger().error(f"corrected_extract parse error: {e}")
+
+                                    self.extract_info_async(
+                                        'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: True',
+                                        _on_corrected_extract
+                                    )
+                                else:
+                                    # irrelevant -> ignore
+                                    pass
+                            except Exception:
+                                traceback.print_exc()
+
+                        self.check_intent_async(text, _on_check_done)
+
+                except Exception:
+                    traceback.print_exc()
+
+            # start chain
+            self.extract_info_async(f'text: {text}, pre_confirmed: {self._operation_cache is not None }', _on_extract_done)
+
+        except Exception:
             traceback.print_exc()
-            print(e)
-        
-        print(3)
 
-    def dispatch_operation(self, candidate: Dict[str, Any]):
-        feedback_text = "操作已提交。"
-        
-        if candidate['intent'] == 'add':
-            self.add_schedule(candidate['new_schedule'])
-            desc = candidate.get('new_schedule', {}).get('description', '日程')
-            feedback_text = f"已添加日程：{desc}。"
-        else:
-            all_schedules = self.list_schedules()
-            candidate.pop('need_confirm')
-            candidate['all_schedules'] = all_schedules
-            generated_operations_str = self.generate_operation(json.dumps(candidate))
-            
-            try:
-                generated_operations = json.loads(generated_operations_str)
-                generated_operations = generated_operations.get('candidates', []) if isinstance(generated_operations, dict) else generated_operations
 
-                op_count = 0
-                for operation in generated_operations:
-                    op_type = operation.get('operation')
-                    match op_type:
-                        case 'edit':
-                            self.patch_schedule(operation)
-                            op_count += 1
-                        case 'delete':
-                            self.delete_schedule(operation)
-                            op_count += 1
-                        case 'query':
-                            # query_schedule don't have to wait as we have already provided llm all the schedules
-                            self.query_schedule_no_wait(operation)
-                            feedback_text += f"您在{operation.get('start_time', '')}有{operation.get('description', '')}的日程。"
+    def dispatch_operation_async(self, candidate: Dict[str, Any]):
+        """
+        Non-blocking dispatch of an operation represented by candidate.
+        For 'add' it publishes add request to editor.
+        For others, it will first fetch schedules async then ask generate_operation_async
+        and then apply generated operations (publish to editor). All are non-blocking.
+        """
+        try:
+            feedback_text = "操作已提交。"
 
-                if candidate['intent'] == 'delete':
-                    feedback_text = f"已删除 {op_count} 个日程。"
-                elif candidate['intent'] == 'edit':
-                    feedback_text = "日程修改成功。"
-            
-            except Exception as e:
-                self.get_logger().error(f"Error parsing/executing operations: {e}")
-                feedback_text = "处理您的请求时遇到了一些问题。"
+            if candidate.get('intent') == 'add':
+                # publish add without waiting
+                self.add_schedule(candidate.get('new_schedule', {}))
+                desc = candidate.get('new_schedule', {}).get('description', '日程')
+                feedback_text = f"已添加日程：{desc}。"
+                self.speak(feedback_text)
+                self.clear_history_async()
+                return
 
-        self.speak(feedback_text)
-        self.clear_history()
+            # for delete/edit/query: need schedules first
+            def _on_list(schedules):
+                try:
+                    # attach schedules to candidate and generate operations
+                    candidate2 = dict(candidate)
+                    candidate2.pop('need_confirm', None)
+                    candidate2['all_schedules'] = schedules or []
+
+                    def _on_generate(gen_str):
+                        try:
+                            if not gen_str:
+                                self.get_logger().warn("generate_operation returned None")
+                                self.speak("处理请求时出错。")
+                                self.clear_history_async()
+                                return
+                            try:
+                                generated_operations = json.loads(gen_str)
+                            except Exception:
+                                generated_operations = gen_str
+
+                            # normalize
+                            if isinstance(generated_operations, dict):
+                                generated_operations = generated_operations.get('candidates', []) or []
+
+                            op_count = 0
+                            feedback = []
+
+                            for operation in generated_operations:
+                                op_type = operation.get('operation')
+                                if op_type == 'edit':
+                                    self.patch_schedule(operation)
+                                    op_count += 1
+                                elif op_type == 'delete':
+                                    self.delete_schedule(operation)
+                                    op_count += 1
+                                elif op_type == 'query':
+                                    # publish a get request but don't wait
+                                    self.query_schedule_no_wait(operation)
+                                    feedback.append(f"您在{operation.get('start_time','')}有{operation.get('description','')}的日程。")
+
+                            if candidate2.get('intent') == 'delete':
+                                feedback_text_local = f"已删除 {op_count} 个日程。"
+                            elif candidate2.get('intent') == 'edit':
+                                feedback_text_local = "日程修改成功。"
+                            else:
+                                feedback_text_local = "操作已完成。"
+
+                            # speak feedback
+                            self.speak("。".join([feedback_text_local] + feedback))
+                            # clear context/history
+                            self.clear_history_async()
+                        except Exception:
+                            traceback.print_exc()
+                            self.speak("处理您的请求时遇到了一些问题。")
+                            self.clear_history_async()
+
+                    # generate operations (async)
+                    self.generate_operation_async(json.dumps(candidate2), _on_generate)
+
+                except Exception:
+                    traceback.print_exc()
+                    self.speak("处理请求时发生异常。")
+                    self.clear_history_async()
+
+            # start by retrieving schedules asynchronously
+            self.list_schedules_async(_on_list)
+
+        except Exception:
+            traceback.print_exc()
+            self.speak("分发操作时出错。")
+            self.clear_history_async()
+
     # -------------------------------
     # Editor publishing helper
     # -------------------------------
-    def _send_to_editor(self, operation: Dict[str, Any]):
+    def _send_to_editor(self, operation: Dict[str, Any], response_cb: Optional[Any] = None) -> str:
+        """
+        Publish an editor request. If response_cb is provided, it will be called as:
+            response_cb(response_payload_dict)
+        when a corresponding response with same request_id is received.
+        This is non-blocking.
+        Returns request_id.
+        """
         if not isinstance(operation, dict):
             raise ValueError("operation must be a dict")
 
@@ -265,10 +349,21 @@ class HubNode(Node):
         payload = json.dumps(operation, ensure_ascii=False)
         msg = String()
         msg.data = payload
+
+        # If a callback is provided, register it so _editor_response_callback can call it.
+        if response_cb is not None:
+            with self._pending_lock:
+                self._pending_events[str(request_id)] = response_cb
+
         self._editor_pub.publish(msg)
-        return request_id # Return ID if needed
+        self.get_logger().info(f"Published to editor op={operation.get('op')} request_id={request_id}")
+        return request_id
     
     def _editor_response_callback(self, msg: String):
+        """
+        Called when editor publishes a response. Will route the response to
+        a registered callback if present, otherwise store result in _pending_responses.
+        """
         try:
             if not msg or not msg.data:
                 return
@@ -279,62 +374,79 @@ class HubNode(Node):
             if not request_id:
                 return
 
-            # 保存响应并触发等待事件（线程安全）
             with self._pending_lock:
+                # If a callback registered, pop and call it (call outside lock)
+                cb = self._pending_events.pop(str(request_id), None)
+                if cb:
+                    # call the callback asynchronously (to avoid blocking subscriber thread)
+                    try:
+                        # schedule the callback on executor pool to avoid long work in subscriber thread
+                        self._executor_pool.submit(cb, payload)
+                    except Exception as e:
+                        # fallback: call directly (best effort)
+                        try:
+                            cb(payload)
+                        except Exception:
+                            traceback.print_exc()
+                    return
+                # else, no callback registered: remember response for later retrieval
                 self._pending_responses[str(request_id)] = payload
-                evt = self._pending_events.get(str(request_id))
-                if evt:
-                    evt.set()
 
         except Exception as e:
-            # 解析异常不要抛出，否则会影响 subscriber 回调线程
+            traceback.print_exc()
             self.get_logger().error(f"_on_editor_response parse error: {e}")
     
-    def _wait_for_response(self, request_id: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    def request_timestamp_async(self, done_cb: Any, timeout: float = 5.0):
         """
-        阻塞等待指定 request_id 的响应，返回解析后的响应 dict 或 None（超时或无效响应）。
-        timeout: 等待秒数（float）
+        Request current timestamp from editor and call done_cb(result_or_None).
+        result is resp.get('data') on success, or None on error/timeout.
         """
-        rid = str(request_id)
-        evt = threading.Event()
-        with self._pending_lock:
-            # 如果已经有响应了（极端情况），直接返回
-            if rid in self._pending_responses:
-                return self._pending_responses.pop(rid, None)
-            self._pending_events[rid] = evt
+        def _on_resp(payload):
+            try:
+                if not payload or not payload.get("ok"):
+                    done_cb(None)
+                    return
+                done_cb(payload.get("data"))
+            except Exception as e:
+                self.get_logger().error(f"request_timestamp_async callback error: {e}")
+                done_cb(None)
 
-        try:
-            waited = evt.wait(timeout=timeout)
-            with self._pending_lock:
-                resp = self._pending_responses.pop(rid, None)
-                # 清理事件对象
-                self._pending_events.pop(rid, None)
-            if not waited:
-                # 超时
-                self.get_logger().warn(f"等待 response 超时 request_id={rid} timeout={timeout}s")
-                return None
-            return resp
-        finally:
-            # 确保事件字典中条目被清理（以防万一）
-            with self._pending_lock:
-                self._pending_events.pop(rid, None)
-    
-    def request_timestamp(self, timeout = 5):
-        rid = self._send_to_editor({'op': 'now', 'args': {}})
-        resp = self._wait_for_response(rid, timeout=timeout)
-        if not resp or not resp.get("ok"):
-            return None
-        return resp.get("data")
-    
-    def list_schedules(self, timeout = 5):
-        rid = self._send_to_editor({'op': 'list', 'args': {}})
-        resp = self._wait_for_response(rid, timeout=timeout)
-        if not resp:
-            return None
-        if not resp.get("ok"):
-            self.get_logger().warn(f"list_schedules error: {resp.get('error')}")
-            return None
-        return resp.get("data", {}).get("schedules")
+        rid = self._send_to_editor({'op': 'now', 'args': {}}, response_cb=_on_resp)
+        # no blocking here; if you want to implement timeout behavior, you can schedule a timer that calls done_cb(None) after timeout if not called.
+
+    def list_schedules_async(self, done_cb: Any, timeout: float = 5.0):
+        """
+        Ask editor for list of schedules, then call done_cb(schedules_list_or_None).
+        """
+        def _on_resp(payload):
+            try:
+                if not payload or not payload.get("ok"):
+                    done_cb(None)
+                    return
+                done_cb(payload.get("data", {}).get("schedules"))
+            except Exception as e:
+                self.get_logger().error(f"list_schedules_async callback error: {e}")
+                done_cb(None)
+
+        rid = self._send_to_editor({'op': 'list', 'args': {}}, response_cb=_on_resp)
+
+    def query_schedule_async(self, operation: Dict[str, Any], done_cb: Any, timeout: float = 5.0):
+        """
+        Query single schedule by id; calls done_cb(schedule_or_None)
+        """
+        def _on_resp(payload):
+            try:
+                if not payload or not payload.get("ok"):
+                    done_cb(None)
+                    return
+                done_cb(payload.get("data", {}).get("schedule"))
+            except Exception as e:
+                self.get_logger().error(f"query_schedule_async callback error: {e}")
+                done_cb(None)
+
+        request_dict = {'op': 'get', 'args': {'id': operation.get('id')}}
+        self._send_to_editor(request_dict, response_cb=_on_resp)
+
     
     def add_schedule(self, operation: Dict[str, Any]):
         new_data = {}
@@ -363,92 +475,118 @@ class HubNode(Node):
         request_dict['op'] = 'update'
         request_dict['args'] = {'id': operation.get('id'), 'patch': patch_data}
         return self._send_to_editor(request_dict)
-    
-    def query_schedule(self, operation: Dict[str, Any], timeout=5):
-        request_dict = {'op': 'get', 'args': {'id': operation.get('id')}}
-        rid = self._send_to_editor(request_dict)
-        resp = self._wait_for_response(rid, timeout=timeout)
-        if not resp:
-            return None
-        if not resp.get("ok"):
-            self.get_logger().warn(f"query_schedule error: {resp.get('error')}")
-            return None
-        return resp.get("data", {}).get("schedule")
-    
-    def query_schedule_no_wait(self, operation: Dict[str, Any]):
-        request_dict = {'op': 'get', 'args': {'id': operation.get('id')}}
-        return self._send_to_editor(request_dict)
 
     # -------------------------------
     # LLM service call helpers (StringForString and SetString)
     # -------------------------------
-    def _call_string_for_string(self, client, text: str, timeout: float) -> Optional[str]:
+    def _call_string_for_string_async(self, client, text: str, done_cb: Any, timeout: Optional[float] = None):
+        """
+        Non-blocking LLM call. Calls done_cb(result_str_or_None).
+        If client.service_is_ready() == False, calls done_cb(None) immediately.
+        """
+        timeout = timeout if timeout is not None else self.llm_timeout
+
         if client is None:
-            self.get_logger().error("LLM client is None.")
-            return None
+            self.get_logger().error("_call_string_for_string_async: client is None.")
+            done_cb(None)
+            return
+
         try:
-            if not client.wait_for_service(timeout_sec=min(1.0, timeout)):
-                self.get_logger().warn(f"Service {getattr(client, 'srv_name', '(unknown)')} not available.")
-                return None
+            if not client.service_is_ready():
+                self.get_logger().warn(f"LLM service {getattr(client, 'srv_name', '(unknown)')} not ready.")
+                done_cb(None)
+                return
         except Exception:
-            self.get_logger().warn("Exception during wait_for_service.")
-            return None
+            # service_is_ready might throw on some setups; proceed to call anyway
+            self.get_logger().warn("Exception checking service_is_ready; proceeding to call.")
 
         req = StringForString.Request()
         req.data = text
-        self.get_logger().info(f"Calling LLM service {getattr(client, 'srv_name', '(unknown)')}: {text}")
-        future = client.call_async(req)
         try:
-            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+            future = client.call_async(req)
         except Exception as e:
-            self.get_logger().error(f"Exception waiting for LLM future: {e}")
-            return None
-        if future.done():
-            resp = future.result()
-            return getattr(resp, 'data', None)
-        else:
-            self.get_logger().warn("LLM call timed out.")
-            return None
+            self.get_logger().error(f"LLM client.call_async failed: {e}")
+            done_cb(None)
+            return
 
-    def send_to_llm(self, text: str, timeout: Optional[float] = None) -> Optional[str]:
-        timeout = timeout if timeout is not None else self.llm_timeout
-        return self._call_string_for_string(self._llm_chat_client, text, timeout)
+        # register done callback
+        def _on_done(fut):
+            try:
+                resp = fut.result()
+                done_cb(getattr(resp, 'data', None))
+            except Exception as e:
+                self.get_logger().error(f"LLM async future error: {e}")
+                done_cb(None)
 
-    def generate_operation(self, text: str, timeout: Optional[float] = None) -> Optional[str]:
-        timeout = timeout if timeout is not None else self.llm_timeout
-        return self._call_string_for_string(self._llm_generate_client, text, timeout)
+        # Some rclpy futures support add_done_callback; this works for most versions
+        try:
+            future.add_done_callback(lambda fut: _on_done(fut))
+        except Exception:
+            traceback.print_exc()
 
-    def extract_info(self, text: str, timeout: Optional[float] = None) -> Optional[str]:
-        timeout = timeout if timeout is not None else self.llm_timeout
-        return self._call_string_for_string(self._llm_extract_client, text, timeout)
+    def extract_info_async(self, text: str, done_cb: Any):
+        return self._call_string_for_string_async(self._llm_extract_client, text, done_cb, timeout=self.llm_timeout)
 
-    def check_intent(self, text: str, timeout: Optional[float] = None) -> Optional[str]:
-        timeout = timeout if timeout is not None else self.llm_timeout
-        return self._call_string_for_string(self._llm_check_client, text, timeout)
+    def check_intent_async(self, text: str, done_cb: Any):
+        return self._call_string_for_string_async(self._llm_check_client, text, done_cb, timeout=self.llm_timeout)
 
-    def clear_history(self, timeout: Optional[float] = None) -> bool:
+    def generate_operation_async(self, text: str, done_cb: Any):
+        return self._call_string_for_string_async(self._llm_generate_client, text, done_cb, timeout=self.llm_timeout)
+
+    def send_to_llm_async(self, text: str, done_cb: Any):
+        return self._call_string_for_string_async(self._llm_chat_client, text, done_cb, timeout=self.llm_timeout)
+
+
+    def clear_history_async(self, done_cb: Optional[Any] = None, timeout: Optional[float] = None):
+        """
+        Clear local state immediately. Optionally call LLM clear_history service,
+        then call done_cb(success_bool) if provided.
+        """
         self._operation_cache = None
         self._state = self.State.IDLE
-        
+
         client = self._llm_clear_client
         if client is None:
-            return False
+            if done_cb:
+                done_cb(False)
+            return
+
         try:
-            if not client.wait_for_service(timeout_sec=min(1.0, timeout or self.llm_timeout)):
-                return False
+            if not client.service_is_ready():
+                self.get_logger().warn("clear_history_async: clear service not ready.")
+                if done_cb:
+                    done_cb(False)
+                return
         except Exception:
-            return False
+            # ignore and attempt call
+            pass
+
         req = SetString.Request()
         req.data = 'clear'
-        future = client.call_async(req)
         try:
-            rclpy.spin_until_future_complete(self, future, timeout_sec=(timeout or self.llm_timeout))
+            future = client.call_async(req)
+        except Exception as e:
+            self.get_logger().error(f"clear_history_async call_async failed: {e}")
+            if done_cb:
+                done_cb(False)
+            return
+
+        def _on_done(fut):
+            try:
+                resp = fut.result()
+                ok = getattr(resp, 'success', False)
+                if done_cb:
+                    done_cb(ok)
+            except Exception as e:
+                self.get_logger().error(f"clear_history_async future error: {e}")
+                if done_cb:
+                    done_cb(False)
+
+        try:
+            future.add_done_callback(lambda fut: _on_done(fut))
         except Exception:
-            return False
-        if future.done():
-            resp = future.result()
-            return getattr(resp, 'success', False)
-        return False
+            traceback.print_exc()
+
     # -------------------------------
     # Shutdown / cleanup
     # -------------------------------
@@ -466,7 +604,7 @@ class HubNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = HubNode()
-    executor = MultiThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()
