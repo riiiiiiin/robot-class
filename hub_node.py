@@ -155,11 +155,11 @@ class HubNode(Node):
                             self.get_logger().warn(f"Error parsing extract_info result: {e}")
                             result = {'candidates': []}
 
-                    # proceed per state
-                    if self._state == self.State.IDLE:
-                        candidates = result.get('candidates', [])
-                        if len(candidates) == 0:
-                            return
+                    
+                    candidates = result.get('candidates', [])
+                    if len(candidates) == 0:
+                        return
+                    else:
                         candidate = candidates[0]
                         if candidate.get('need_confirm'):
                             self._state = self.State.NEED_CONFIRM
@@ -188,52 +188,50 @@ class HubNode(Node):
                                 self.dispatch_operation_async(candidate)
                             except Exception as e:
                                 self.get_logger().error(f"dispatch_operation_async error: {e}")
-                    elif self._state == self.State.NEED_CONFIRM:
-                        # user input is in 'text' variable above; call check_intent_async
-                        def _on_check_done(check_str):
-                            try:
-                                if not check_str:
-                                    return
-                                res = json.loads(check_str)
-                                intent = res.get('intent')
-                                if intent == 'confirm':
-                                    self.dispatch_operation_async(self._operation_cache)
-                                elif intent == 'deny':
-                                    self.speak("好的，已取消。")
-                                    # clear_history_async no blocking
-                                    self.clear_history_async()
-                                elif intent == 'edit':
-                                    # ask LLM to extract corrected info (async)
-                                    def _on_corrected_extract(corrected_str):
-                                        try:
-                                            if not corrected_str:
-                                                return
-                                            corrected_json = json.loads(corrected_str)
-                                            corrected_candidates = corrected_json.get('candidates', [])
-                                            if len(corrected_candidates) == 0:
-                                                return
-                                            corrected_candidate = corrected_candidates[0]
-                                            self.dispatch_operation_async(corrected_candidate)
-                                        except Exception as e:
-                                            self.get_logger().error(f"corrected_extract parse error: {e}")
-
-                                    self.extract_info_async(
-                                        'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: True',
-                                        _on_corrected_extract
-                                    )
-                                else:
-                                    # irrelevant -> ignore
-                                    pass
-                            except Exception:
-                                traceback.print_exc()
-
-                        self.check_intent_async(text, _on_check_done)
-
                 except Exception:
                     traceback.print_exc()
+            
+            def _on_check_done(check_str):
+                try:
+                    if not check_str:
+                        return
+                    res = json.loads(check_str)
+                    intent = res.get('intent')
+                    print(intent)
+                    if intent == 'confirm':
+                        self.dispatch_operation_async(self._operation_cache)
+                    elif intent == 'deny':
+                        self.speak("好的，已取消。")
+                        # clear_history_async no blocking
+                        self.clear_history_async()
+                    elif intent == 'edit':
+                        # ask LLM to extract corrected info (async)
+                        def _on_corrected_extract(corrected_str):
+                            try:
+                                if not corrected_str:
+                                    return
+                                corrected_json = json.loads(corrected_str)
+                                corrected_candidates = corrected_json.get('candidates', [])
+                                if len(corrected_candidates) == 0:
+                                    return
+                                corrected_candidate = corrected_candidates[0]
+                                self.dispatch_operation_async(corrected_candidate)
+                            except Exception as e:
+                                self.get_logger().error(f"corrected_extract parse error: {e}")
 
-            # start chain
-            self.extract_info_async(f'text: {text}, pre_confirmed: {self._operation_cache is not None }', _on_extract_done)
+                        self.extract_info_async(
+                            'text: "用户在之前的对话中，提出了进行日程操作，以及对细节的更正，请你综合上下文提取。", pre_confirmed: True',
+                            _on_corrected_extract
+                        )
+                    else:
+                        # irrelevant -> ignore
+                        pass
+                except Exception:
+                    traceback.print_exc()               
+            if self._state == self.State.IDLE:
+                self.extract_info_async(f'text: {text}, pre_confirmed: {self._operation_cache is not None }', _on_extract_done)
+            elif self._state == self.State.NEED_CONFIRM:
+                self.check_intent_async(text, _on_check_done)
 
         except Exception:
             traceback.print_exc()
@@ -295,8 +293,11 @@ class HubNode(Node):
                                     op_count += 1
                                 elif op_type == 'query':
                                     # publish a get request but don't wait
-                                    self.query_schedule_no_wait(operation)
+                                    def _on_get(x):
+                                        pass
+                                    self.query_schedule_async(operation, _on_get)
                                     feedback.append(f"您在{operation.get('start_time','')}有{operation.get('description','')}的日程。")
+                                    
 
                             if candidate2.get('intent') == 'delete':
                                 feedback_text_local = f"已删除 {op_count} 个日程。"
@@ -307,11 +308,10 @@ class HubNode(Node):
 
                             # speak feedback
                             self.speak("。".join([feedback_text_local] + feedback))
-                            # clear context/history
-                            self.clear_history_async()
                         except Exception:
                             traceback.print_exc()
                             self.speak("处理您的请求时遇到了一些问题。")
+                        finally:
                             self.clear_history_async()
 
                     # generate operations (async)
@@ -486,6 +486,7 @@ class HubNode(Node):
         """
         timeout = timeout if timeout is not None else self.llm_timeout
 
+        print(f'client: {client}, text: {text}')
         if client is None:
             self.get_logger().error("_call_string_for_string_async: client is None.")
             done_cb(None)
