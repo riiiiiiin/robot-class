@@ -11,6 +11,7 @@ import json
 import uuid
 from enum import Enum
 import traceback
+from time_util import convert_chinese_datetime
 
 from service_define.srv import StringForString
 from service_define.srv import SetString 
@@ -103,6 +104,7 @@ class HubNode(Node):
         if not text:
             return
         
+        text = convert_chinese_datetime(text)
         # 简单检查服务是否就绪，不阻塞
         if self._tts_client.service_is_ready():
             req = SetString.Request()
