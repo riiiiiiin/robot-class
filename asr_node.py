@@ -28,6 +28,9 @@ class CombinedVADASRNode(Node):
     Combined VAD and ASR system as a ROS 2 Node.
     Automatically detects speech activity and performs ASR when speech is detected,
     publishing results to '/asr_result' topic.
+
+    This variant adds a gate controlled by the TTS lifecycle topic 'tts_life' (std_msgs/String).
+    When TTS publishes 'start' the ASR node will pause and ignore audio until it receives 'end'.
     """
     
     def __init__(self, node_name='asr_local_node'):
@@ -65,6 +68,10 @@ class CombinedVADASRNode(Node):
         self._audio_thread = None
         self._audio_thread_running = False
         self._audio_thread_lock = threading.Lock()
+
+        # TTS gate state and lock
+        self.tts_playing = False
+        self._tts_lock = threading.Lock()
 
         # Initialize node components automatically
         self.initialize_node()
@@ -135,6 +142,11 @@ class CombinedVADASRNode(Node):
         self.asr_result_publisher = self.create_publisher(String, '/asr_result', 10)
         self.get_logger().info("Publisher '/asr_result' created.")
 
+        # Subscribe to TTS lifecycle topic to gate ASR
+        # TTS publishes plain String messages: 'start' and 'end'
+        self.create_subscription(String, 'tts_life', self._tts_life_cb, 10)
+        self.get_logger().info("Subscribed to 'tts_life' for TTS lifecycle gating.")
+
         # Initialize PyAudio and start audio processing
         try:
             self.p_audio = pyaudio.PyAudio()
@@ -160,6 +172,45 @@ class CombinedVADASRNode(Node):
         
         self.get_logger().info("Node fully initialized and started ASR listening thread.")
 
+    # --- TTS gating callback and helpers ---
+    def _tts_life_cb(self, msg: String):
+        """Handle TTS lifecycle messages to gate ASR.
+
+        Expected payloads: 'start' -> TTS begins playing, 'end' -> TTS finished.
+        Case-insensitive.
+        """
+        text = msg.data.strip().lower() if msg.data is not None else ''
+        if text == 'start':
+            with self._tts_lock:
+                if not self.tts_playing:
+                    self.tts_playing = True
+                    # If currently recording, discard the recording to avoid publishing ASR of robot voice
+                    if self.is_recording:
+                        self.get_logger().info('TTS started during recording: discarding current recording to avoid self-recognition')
+                        self._discard_recording()
+                    # Clear pre-speech buffer so we don't include robot audio into future recordings
+                    self.pre_speech_buffer.clear()
+                    self.get_logger().info('ASR paused because TTS started')
+        elif text == 'end':
+            with self._tts_lock:
+                if self.tts_playing:
+                    self.tts_playing = False
+                    # Freshen pre-speech buffer (empty) so we start listening from clean state
+                    self.pre_speech_buffer.clear()
+                    self.get_logger().info('ASR resumed because TTS ended')
+        else:
+            self.get_logger().warn(f"Unrecognized tts_life payload: '{msg.data}' (expect 'start' or 'end')")
+
+    def _discard_recording(self):
+        """Stop current recording and clear buffers without running recognition."""
+        try:
+            self.is_recording = False
+            self.audio_data = []
+            # pre_speech_buffer already cleared by caller
+        except Exception as e:
+            self.get_logger().error(f"Error while discarding recording: {e}")
+
+    # --- Audio thread ---
     def _audio_thread_func(self):
         """Thread function for audio processing loop"""
         self.get_logger().info("Audio processing thread started.")
@@ -172,7 +223,15 @@ class CombinedVADASRNode(Node):
                 rms = np.mean(np.square(audio_chunk_int16-np.mean(audio_chunk_int16)))
                 if rms < self.rms_threshold:
                     audio_chunk_int16 = np.zeros_like(audio_chunk_int16).tobytes()
-                
+
+                # If TTS is playing, skip VAD/recording logic to avoid recognizing robot output.
+                with self._tts_lock:
+                    tts_now = self.tts_playing
+
+                if tts_now:
+                    # consume audio but do not add to pre-speech buffer or VAD processing
+                    continue
+
                 # Add current chunk to pre-speech buffer
                 self.pre_speech_buffer.append(audio_chunk_int16)
 
